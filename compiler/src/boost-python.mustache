@@ -133,6 +133,16 @@ BOOST_PYTHON_MODULE({{fileBasename}})
   {
     auto klass = class_<{{typeFullName}}::Builder>("Builder", no_init);
     scope within(klass);
+{{#typeUnion}}
+    klass.def("which", &{{typeFullName}}::Builder::which);
+{{/typeUnion}}
+{{#typeStruct}}
+{{#structUnions}}
+
+  // {{unionDecl}}
+  klass.add_property("{{unionName}}", &{{typeParentName}}::Builder::get{{unionTitleCase}});
+{{/structUnions}}
+{{/typeStruct}}
 {{#typeFields}}
 
   // {{fieldDecl}}
@@ -169,10 +179,27 @@ BOOST_PYTHON_MODULE({{fileBasename}})
     ;
 {{/structNestedEnums}}
 {{/typeStruct}}
+{{#typeUnion}}
+  enum_<{{typeFullName}}::Which>("Which")
+{{#unionFields}}
+    .value("{{fieldUpperCase}}", {{typeFullName}}::Which::{{fieldUpperCase}})
+{{/unionFields}}
+    ;
+{{/typeUnion}}
 
   {
     auto klass = class_<{{typeFullName}}::Reader>("Reader", no_init);
     scope within(klass);
+{{#typeUnion}}
+    klass.def("which", &{{typeFullName}}::Reader::which);
+{{/typeUnion}}
+{{#typeStruct}}
+{{#structUnions}}
+
+  // {{unionDecl}}
+  klass.add_property("{{unionName}}", &{{typeParentName}}::Reader::get{{unionTitleCase}});
+{{/structUnions}}
+{{/typeStruct}}
 {{#typeFields}}
 
   // {{fieldDecl}}

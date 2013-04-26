@@ -266,7 +266,8 @@ unionContext parent desc = mkStrContext context where
     context "typeFullNamePython" = MuVariable $ replace "::" "_" fullNameString
     context "isTopLevel" = MuBool $ isTopLevel
     context "isChild" = MuBool $ not isTopLevel
-    context "typeParentNamePython" = MuVariable $ take ((length (fullNameString)) - (length (unionName desc)) - 2) fullNameString
+    context "typeParentName" = MuVariable $ take ((length (fullNameString)) - (length (unionName desc)) - 2) fullNameString
+    context "typeParentNamePython" = MuVariable $ replace "::" "_" $ take ((length (fullNameString)) - (length (unionName desc)) - 2) fullNameString
 
     context "unionName" = MuVariable $ unionName desc
     context "unionFullName" = MuVariable $ fullNameString
@@ -292,7 +293,8 @@ structContext parent desc = mkStrContext context where
     context "typeFullNamePython" = MuVariable $ replace "::" "_" $ fullNameString
     context "isTopLevel" = MuBool $ isTopLevel
     context "isChild" = MuBool $ not isTopLevel
-    context "typeParentNamePython" = MuVariable $ take ((length (fullNameString)) - (length (structName desc)) - 2) fullNameString
+    context "typeParentName" = MuVariable $ take ((length (fullNameString)) - (length (structName desc)) - 2) fullNameString
+    context "typeParentNamePython" = MuVariable $ replace "::" "_" $ take ((length (fullNameString)) - (length (structName desc)) - 2) fullNameString
 
     context "structName" = MuVariable $ structName desc
     context "structFullName" = MuVariable $ fullNameString
