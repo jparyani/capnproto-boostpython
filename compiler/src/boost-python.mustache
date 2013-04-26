@@ -103,7 +103,7 @@ object safeGetItem(T & obj, size_t index)
 {
 
   if (index >= obj.size() || index < 0) {
-  PyErr_SetString(PyExc_StopIteration, "No more data.");
+  PyErr_SetString(PyExc_IndexError, "Outside of bounds.");
   boost::python::throw_error_already_set();
   }
 
@@ -146,27 +146,18 @@ BOOST_PYTHON_MODULE({{fileBasename}})
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
     klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
 {{/fieldIsStruct}}
-{{#fieldIsNonStructList}}
+{{#fieldIsList}}
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
     klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
 
     class_< {{fieldType}}::Builder >("List{{fieldElementTypePython}}Builder", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
+  {{#fieldIsNonStructList}}
+      .def("__setitem__", &{{fieldType}}::Builder::set)
+  {{/fieldIsNonStructList}}
       .def("__len__", &{{fieldType}}::Builder::size)
       ;
-    
-{{/fieldIsNonStructList}}
-{{#fieldIsStructList}}
-    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
-    klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
-
-    class_< {{fieldType}}::Builder >("List{{fieldElementTypePython}}Builder", no_init)
-      .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
-      .def("__len__", &{{fieldType}}::Builder::size)
-      ;
-      
-{{/fieldIsStructList}}
-
+{{/fieldIsList}}
 {{/typeFields}}
   }
 {{#typeStruct}}
@@ -194,22 +185,14 @@ BOOST_PYTHON_MODULE({{fileBasename}})
 {{#fieldIsStruct}}
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
 {{/fieldIsStruct}}
-{{#fieldIsNonStructList}}
+{{#fieldIsList}}
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
 
     class_< {{fieldType}}::Reader >("List{{fieldElementTypePython}}Reader", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
       .def("__len__", &{{fieldType}}::Reader::size)
       ;
-{{/fieldIsNonStructList}}
-{{#fieldIsStructList}}
-    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
-
-    class_< {{fieldType}}::Reader >("List{{fieldElementTypePython}}Reader", no_init)
-      .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
-      .def("__len__", &{{fieldType}}::Reader::size)
-      ;
-{{/fieldIsStructList}}
+{{/fieldIsList}}
 {{/typeFields}}
   }
 }
@@ -236,6 +219,10 @@ BOOST_PYTHON_MODULE({{fileBasename}})
     ;
   class_< ::capnproto::MallocMessageBuilder, bases< ::capnproto::MessageBuilder >, boost::noncopyable >("MallocMessageBuilder");
 
+  class_< ::capnproto::ReaderOptions>("ReaderOptions")
+    .def_readwrite("traversalLimitInWords", &::capnproto::ReaderOptions::traversalLimitInWords)
+    .def_readwrite("nestingLimit", &::capnproto::ReaderOptions::nestingLimit)
+    ;
   class_< ::capnproto::MessageReader, boost::noncopyable>("MessageReader", no_init)
 {{#fileTypes}}
 {{#typeStructOrUnion}}
@@ -244,10 +231,18 @@ BOOST_PYTHON_MODULE({{fileBasename}})
 {{/fileTypes}}
     ;
 
-  class_< ::capnproto::PackedFdMessageReader, bases< ::capnproto::MessageReader >, boost::noncopyable >("PackedFdMessageReader", init<int>());
+  //TODO: ::capnproto::InputStreamMessageReader
+  //TODO: ::capnproto::PackedMessageReader
+  class_< ::capnproto::StreamFdMessageReader, bases< ::capnproto::MessageReader >, boost::noncopyable >("StreamFdMessageReader", init<int>())
+  .def(init<int, ::capnproto::ReaderOptions>());
+  class_< ::capnproto::PackedFdMessageReader, bases< ::capnproto::MessageReader >, boost::noncopyable >("PackedFdMessageReader", init<int>())
+  .def(init<int, ::capnproto::ReaderOptions>());
 
   initializeStringConverters< ::capnproto::Text::Builder>();
   initializeStringConverters< ::capnproto::Text::Reader>();
 
+  //TODO: ::capnproto::writeMessage
+  //TODO: ::capnproto::writePackedMessage
+  def("writeMessageToFd", static_cast<void (*)(int fd, ::capnproto::MessageBuilder& builder)>(&::capnproto::writeMessageToFd));
   def("writePackedMessageToFd", static_cast<void (*)(int fd, ::capnproto::MessageBuilder& builder)>(&::capnproto::writePackedMessageToFd));
 }
