@@ -1,0 +1,216 @@
+{{!
+| Copyright (c) 2013, Kenton Varda <temporal@gmail.com>
+| All rights reserved.
+|
+| Redistribution and use in source and binary forms, with or without
+| modification, are permitted provided that the following conditions are met:
+|
+| 1. Redistributions of source code must retain the above copyright notice, this
+|    list of conditions and the following disclaimer.
+| 2. Redistributions in binary form must reproduce the above copyright notice,
+|    this list of conditions and the following disclaimer in the documentation
+|    and/or other materials provided with the distribution.
+|
+| THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+| ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+| WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+| DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+| ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+| (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+| LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+| ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+| (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+| SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Template for generated C++ header files.
+}}// Generated code, DO NOT EDIT
+
+#include <boost/python.hpp>
+#include <capnproto/message.h>
+#include <capnproto/serialize-packed.h>
+#include <Python.h>
+#include "{{fileName}}.h"
+
+using namespace boost::python;
+
+template<class T>
+struct custom_str_to_python_str
+{
+    static PyObject* convert(T const& s)
+      {
+      const char * ret = s;
+        return boost::python::incref(
+          boost::python::object(ret).ptr());
+      }
+};
+
+template<class T>
+struct custom_str_from_python_str
+{
+  custom_str_from_python_str()
+    {
+      boost::python::converter::registry::push_back(
+        &convertible,
+        &construct,
+        boost::python::type_id<T>());
+    }
+
+    // Determine if obj_ptr can be converted in a custom string
+    static void* convertible(PyObject* obj_ptr)
+    {
+      if (!PyString_Check(obj_ptr)) return 0;
+      return obj_ptr;
+    }
+
+    // Convert obj_ptr into a custom string
+    static void construct(
+    PyObject* obj_ptr,
+    boost::python::converter::rvalue_from_python_stage1_data* data)
+    {
+      // Extract the character data from the python string
+      char* value = PyString_AsString(obj_ptr);
+
+      // Grab pointer to memory into which to construct the new custom string
+      void* storage = (
+        (boost::python::converter::rvalue_from_python_storage<T>*)
+        data)->storage.bytes;
+
+      // in-place construct the new custom string using the character data
+      // extraced from the python object
+      new (storage) T(value, PyString_Size(obj_ptr));
+
+      // Stash the memory chunk pointer for later use by boost.python
+      data->convertible = storage;
+    }
+};
+
+template <class T>
+void initializeStringConverters()
+{
+  using namespace boost::python;
+
+  // register the to-python converter
+  to_python_converter<
+  T,
+    custom_str_to_python_str<T> >();
+
+  // register the from-python converter
+  custom_str_from_python_str<T>();
+}
+
+template<class T>
+object safeGetItem(T & obj, size_t index)
+{
+
+  if (index > obj.size()) {
+  PyErr_SetString(PyExc_StopIteration, "No more data.");
+  boost::python::throw_error_already_set();
+  }
+
+  return object(obj[index]);
+}
+
+BOOST_PYTHON_MODULE({{fileBasename}})
+{
+
+{{#fileTypes}}
+{{#typeStructOrUnion}}
+  {
+    auto klass = class_<{{typeFullName}}::Builder>("{{typeFullName}}::Builder", no_init);
+{{#typeFields}}
+
+  // {{fieldDecl}}
+{{#fieldIsPrimitive}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}}, &{{typeFullName}}::Builder::set{{fieldTitleCase}});
+{{/fieldIsPrimitive}}
+{{#fieldIsBlob}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}}, &{{typeFullName}}::Builder::set{{fieldTitleCase}});
+{{/fieldIsBlob}}
+{{#fieldIsStruct}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
+    klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
+{{/fieldIsStruct}}
+{{#fieldIsNonStructList}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
+    klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
+
+    class_< {{fieldType}}::Builder >("List{{fieldElementType}}Builder", no_init)
+      .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
+      .def("__len__", &{{fieldType}}::Builder::size)
+      ;
+    
+{{/fieldIsNonStructList}}
+{{#fieldIsStructList}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
+    klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
+
+    class_< {{fieldType}}::Builder >("List{{fieldElementType}}Builder", no_init)
+      .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
+      .def("__len__", &{{fieldType}}::Builder::size)
+      ;
+      
+{{/fieldIsStructList}}
+{{/typeFields}}
+      ;
+  }
+  {
+    auto klass = class_<{{typeFullName}}::Reader>("{{typeFullName}}::Reader", no_init);
+{{#typeFields}}
+
+  // {{fieldDecl}}
+{{#fieldIsPrimitive}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
+{{/fieldIsPrimitive}}
+{{#fieldIsBlob}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
+{{/fieldIsBlob}}
+{{#fieldIsStruct}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
+{{/fieldIsStruct}}
+{{#fieldIsNonStructList}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
+
+    class_< {{fieldType}}::Reader >("List{{fieldElementType}}Reader", no_init)
+      .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
+      .def("__len__", &{{fieldType}}::Reader::size)
+      ;
+{{/fieldIsNonStructList}}
+{{#fieldIsStructList}}
+    klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
+
+    class_< {{fieldType}}::Reader >("List{{fieldElementType}}Reader", no_init)
+      .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
+      .def("__len__", &{{fieldType}}::Reader::size)
+      ;
+{{/fieldIsStructList}}
+{{/typeFields}}
+      ;
+  }
+{{/typeStructOrUnion}}
+{{/fileTypes}}
+
+  class_< ::capnproto::MessageBuilder, boost::noncopyable>("MessageBuilder", no_init)
+{{#fileTypes}}
+{{#typeStructOrUnion}}
+    .def("initRoot{{typeFullName}}", &::capnproto::MessageBuilder::initRoot<{{typeFullName}}>)
+    .def("getRoot{{typeFullName}}", &::capnproto::MessageBuilder::getRoot<{{typeFullName}}>)
+{{/typeStructOrUnion}}
+{{/fileTypes}}
+    ;
+  class_< ::capnproto::MallocMessageBuilder, bases< ::capnproto::MessageBuilder >, boost::noncopyable >("MallocMessageBuilder");
+
+  class_< ::capnproto::MessageReader, boost::noncopyable>("MessageReader", no_init)
+{{#fileTypes}}
+{{#typeStructOrUnion}}
+    .def("getRoot{{typeFullName}}", &::capnproto::MessageReader::getRoot<{{typeFullName}}>)
+{{/typeStructOrUnion}}
+{{/fileTypes}}
+    ;
+
+  class_< ::capnproto::PackedFdMessageReader, bases< ::capnproto::MessageReader >, boost::noncopyable >("PackedFdMessageReader", init<int>());
+
+  initializeStringConverters< ::capnproto::Text::Builder>();
+  initializeStringConverters< ::capnproto::Text::Reader>();
+
+  def("writePackedMessageToFd", static_cast<void (*)(int fd, ::capnproto::MessageBuilder& builder)>(&::capnproto::writePackedMessageToFd));
+}

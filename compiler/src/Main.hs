@@ -45,10 +45,11 @@ import qualified Data.ByteString.Lazy.Char8 as LZ
 import Semantics
 
 import CxxGenerator(generateCxx)
+import BoostPythonGenerator(generateBoost)
 
 type GeneratorFn = FileDesc -> IO [(FilePath, LZ.ByteString)]
 
-generatorFns = Map.fromList [ ("c++", generateCxx) ]
+generatorFns = Map.fromList [ ("c++", generateCxx), ("boost-python", generateBoost) ]
 
 data Opt = SearchPathOpt FilePath
          | OutputOpt String (Maybe GeneratorFn) FilePath
