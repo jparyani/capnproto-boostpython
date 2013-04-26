@@ -22,6 +22,7 @@ executable capnpc
                    filepath,
                    directory,
                    syb,
+                   MissingH,
                    transformers
   ghc-options:     -Wall -fno-warn-missing-signatures
   other-modules:

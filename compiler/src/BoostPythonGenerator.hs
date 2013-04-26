@@ -38,6 +38,7 @@ import Text.Hastache
 import Text.Hastache.Context
 import qualified Codec.Binary.UTF8.String as UTF8
 import System.FilePath(takeBaseName)
+import Data.String.Utils(replace, strip)
 
 import Semantics
 import Util
@@ -239,6 +240,8 @@ fieldContext parent desc = mkStrContext context where
         MuVariable $ cxxFieldSizeString $ elementSize $ elementType $ fieldType desc
     context "fieldElementType" =
         MuVariable $ cxxTypeString $ elementType $ fieldType desc
+    context "fieldElementTypePython" =
+        MuVariable $ strip $ replace "::" "" $ cxxTypeString $ elementType $ fieldType desc
     context "fieldUnion" = case fieldUnion desc of
         Just (u, _) -> muJust $ unionContext context u
         Nothing -> muNull
@@ -252,16 +255,21 @@ fieldContext parent desc = mkStrContext context where
 
 unionContext parent desc = mkStrContext context where
     titleCase = toTitleCase $ unionName desc
+    fullNameString = fullName (DescStruct $ unionParent desc) ++ "::" ++ titleCase
+    isTopLevel = (length $ filter (== ':') fullNameString) == 0
 
     context "typeStruct" = MuBool False
     context "typeUnion" = MuBool True
     context "typeName" = MuVariable titleCase
     context "typeFullName" = context "unionFullName"
     context "typeFields" = context "unionFields"
+    context "typeFullNamePython" = MuVariable $ replace "::" "_" fullNameString
+    context "isTopLevel" = MuBool $ isTopLevel
+    context "isChild" = MuBool $ not isTopLevel
+    context "typeParentNamePython" = MuVariable $ take ((length (fullNameString)) - (length (unionName desc)) - 2) fullNameString
 
     context "unionName" = MuVariable $ unionName desc
-    context "unionFullName" = MuVariable $ fullName (DescStruct $ unionParent desc) ++
-                             "::" ++ titleCase
+    context "unionFullName" = MuVariable $ fullNameString
     context "unionDecl" = MuVariable $ descDecl $ DescUnion desc
     context "unionTitleCase" = MuVariable titleCase
     context "unionTagOffset" = MuVariable $ unionTagOffset desc
@@ -273,14 +281,21 @@ childContext parent name = mkStrContext context where
     context s = parent s
 
 structContext parent desc = mkStrContext context where
+    fullNameString = fullName (DescStruct desc)
+    isTopLevel = (length $ filter (== ':') fullNameString) == 0
+    
     context "typeStruct" = MuBool True
     context "typeUnion" = MuBool False
     context "typeName" = context "structName"
     context "typeFullName" = context "structFullName"
     context "typeFields" = context "structFields"
+    context "typeFullNamePython" = MuVariable $ replace "::" "_" $ fullNameString
+    context "isTopLevel" = MuBool $ isTopLevel
+    context "isChild" = MuBool $ not isTopLevel
+    context "typeParentNamePython" = MuVariable $ take ((length (fullNameString)) - (length (structName desc)) - 2) fullNameString
 
     context "structName" = MuVariable $ structName desc
-    context "structFullName" = MuVariable $ fullName (DescStruct desc)
+    context "structFullName" = MuVariable $ fullNameString
     context "structFields" = MuList $ map (fieldContext context) $ structFields desc
     context "structUnions" = MuList $ map (unionContext context) $ structUnions desc
     context "structDataSize" = MuVariable $ packingDataSize $ structPacking desc

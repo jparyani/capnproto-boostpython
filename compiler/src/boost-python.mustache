@@ -112,11 +112,27 @@ object safeGetItem(T & obj, size_t index)
 
 BOOST_PYTHON_MODULE({{fileBasename}})
 {
+  scope * curr_scope;
+{{#fileTypes}}
+{{#typeStructOrUnion}}
+{{#isTopLevel}}
+  auto klass_{{typeFullNamePython}} = class_<{{typeFullName}}>("{{typeFullNamePython}}", no_init);
+{{/isTopLevel}}
+{{#isChild}}
+  curr_scope = new scope(klass_{{typeParentNamePython}});
+  auto klass_{{typeFullNamePython}} = class_<{{typeFullName}}>("{{typeName}}", no_init);
+  delete curr_scope;
+{{/isChild}}
+{{/typeStructOrUnion}}
+{{/fileTypes}}
 
 {{#fileTypes}}
 {{#typeStructOrUnion}}
+{
+  scope within_parent(klass_{{typeFullNamePython}});
   {
-    auto klass = class_<{{typeFullName}}::Builder>("{{typeFullName}}::Builder", no_init);
+    auto klass = class_<{{typeFullName}}::Builder>("Builder", no_init);
+    scope within(klass);
 {{#typeFields}}
 
   // {{fieldDecl}}
@@ -134,7 +150,7 @@ BOOST_PYTHON_MODULE({{fileBasename}})
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
     klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
 
-    class_< {{fieldType}}::Builder >("List{{fieldElementType}}Builder", no_init)
+    class_< {{fieldType}}::Builder >("List{{fieldElementTypePython}}Builder", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
       .def("__len__", &{{fieldType}}::Builder::size)
       ;
@@ -144,17 +160,28 @@ BOOST_PYTHON_MODULE({{fileBasename}})
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Builder::get{{fieldTitleCase}});
     klass.def("init{{fieldTitleCase}}", &{{typeFullName}}::Builder::init{{fieldTitleCase}});
 
-    class_< {{fieldType}}::Builder >("List{{fieldElementType}}Builder", no_init)
+    class_< {{fieldType}}::Builder >("List{{fieldElementTypePython}}Builder", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Builder >)
       .def("__len__", &{{fieldType}}::Builder::size)
       ;
       
 {{/fieldIsStructList}}
+
 {{/typeFields}}
-      ;
   }
+{{#typeStruct}}
+{{#structNestedEnums}}
+  enum_<{{typeFullName}}::{{enumName}}>("{{enumName}}")
+{{#enumerants}}
+    .value("{{enumerantName}}", {{typeFullName}}::{{enumName}}::{{enumerantName}})
+{{/enumerants}}
+    ;
+{{/structNestedEnums}}
+{{/typeStruct}}
+
   {
-    auto klass = class_<{{typeFullName}}::Reader>("{{typeFullName}}::Reader", no_init);
+    auto klass = class_<{{typeFullName}}::Reader>("Reader", no_init);
+    scope within(klass);
 {{#typeFields}}
 
   // {{fieldDecl}}
@@ -170,7 +197,7 @@ BOOST_PYTHON_MODULE({{fileBasename}})
 {{#fieldIsNonStructList}}
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
 
-    class_< {{fieldType}}::Reader >("List{{fieldElementType}}Reader", no_init)
+    class_< {{fieldType}}::Reader >("List{{fieldElementTypePython}}Reader", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
       .def("__len__", &{{fieldType}}::Reader::size)
       ;
@@ -178,22 +205,32 @@ BOOST_PYTHON_MODULE({{fileBasename}})
 {{#fieldIsStructList}}
     klass.add_property("{{fieldName}}", &{{typeFullName}}::Reader::get{{fieldTitleCase}});
 
-    class_< {{fieldType}}::Reader >("List{{fieldElementType}}Reader", no_init)
+    class_< {{fieldType}}::Reader >("List{{fieldElementTypePython}}Reader", no_init)
       .def("__getitem__", &::safeGetItem< {{fieldType}}::Reader >)
       .def("__len__", &{{fieldType}}::Reader::size)
       ;
 {{/fieldIsStructList}}
 {{/typeFields}}
-      ;
   }
+}
 {{/typeStructOrUnion}}
 {{/fileTypes}}
+
+{{#fileEnums}}
+  enum_<{{{enumName}}>("{{enumName}}")
+{{#enumerants}}
+    .value("{{enumerantName}}", {{enumName}}::{{enumerantName}})
+{{/enumerants}}
+    ;
+{{/fileEnums}}
 
   class_< ::capnproto::MessageBuilder, boost::noncopyable>("MessageBuilder", no_init)
 {{#fileTypes}}
 {{#typeStructOrUnion}}
+{{#typeStruct}}
     .def("initRoot{{typeFullName}}", &::capnproto::MessageBuilder::initRoot<{{typeFullName}}>)
     .def("getRoot{{typeFullName}}", &::capnproto::MessageBuilder::getRoot<{{typeFullName}}>)
+{{/typeStruct}}   
 {{/typeStructOrUnion}}
 {{/fileTypes}}
     ;
