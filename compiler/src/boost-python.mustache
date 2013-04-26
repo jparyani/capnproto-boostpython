@@ -102,7 +102,7 @@ template<class T>
 object safeGetItem(T & obj, size_t index)
 {
 
-  if (index > obj.size()) {
+  if (index >= obj.size() || index < 0) {
   PyErr_SetString(PyExc_StopIteration, "No more data.");
   boost::python::throw_error_already_set();
   }
