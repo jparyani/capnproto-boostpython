@@ -245,4 +245,8 @@ BOOST_PYTHON_MODULE({{fileBasename}})
   //TODO: ::capnproto::writePackedMessage
   def("writeMessageToFd", static_cast<void (*)(int fd, ::capnproto::MessageBuilder& builder)>(&::capnproto::writeMessageToFd));
   def("writePackedMessageToFd", static_cast<void (*)(int fd, ::capnproto::MessageBuilder& builder)>(&::capnproto::writePackedMessageToFd));
+  
+  enum_< ::capnproto::Void>("Void")
+    .value("VOID", ::capnproto::Void::VOID)
+    ;
 }
