@@ -113,12 +113,19 @@ compiled with -fpic
 * `sudo apt-get install libboost-python-dev` (or the equivalent for your distro. Tested working on ubuntu 12.10)
 * clone this capnproto repo
 * (Re)install the compiler:
-  cd capnproto/compiler
-  cabal install capnproto-compiler.cabal
-* Configure the Capn Proto C++ runtime with -fpic and then (re)install it:
-  cd ../c++
-  CXXFLAGS="-O2 -DNDEBUG -I$HOME/gtest-install/include -fpic" LDFLAGS="-L$HOME/gtest-install/lib" ./configure; make clean; sudo make install`
 
+```
+cd capnproto/compiler
+cabal install capnproto-compiler.cabal
+```
+* Configure the Capn Proto C++ runtime with -fpic and then (re)install it:
+
+```
+cd ../c++
+CXXFLAGS="-O2 -DNDEBUG -I$HOME/gtest-install/include -fpic" LDFLAGS="-L$HOME/gtest-install/lib" ./configure
+make clean
+sudo make install
+```
 ## Generating Code
 
 To generate C++ code from your `.capnp` [interface definition](language.html), run:
