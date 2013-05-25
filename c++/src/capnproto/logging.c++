@@ -93,7 +93,7 @@ static Array<char> makeDescription(DescriptionStyle style, const char* code, int
     ++index;
 
     if (index != argValues.size()) {
-      getExceptionCallback()->logMessage(
+      getExceptionCallback().logMessage(
           str(__FILE__, ":", __LINE__, ": Failed to parse logging macro args into ",
               argValues.size(), " names: ", macroArgs, '\n'));
     }
@@ -130,8 +130,8 @@ static Array<char> makeDescription(DescriptionStyle style, const char* code, int
       sysErrorArray = arrayPtr(strerror_r(errorNumber, buffer, sizeof(buffer)));
     }
 #else
-    // TODO:  Other unixes should have strerror_r but it may have a different signature.  Port for
-    //   thread-safety.
+    // TODO(port):  Other unixes should have strerror_r but it may have a different signature.
+    //   Port for thread-safety.
     sysErrorArray = arrayPtr(strerror(errorNumber));
 #endif
 
@@ -191,7 +191,7 @@ static Array<char> makeDescription(DescriptionStyle style, const char* code, int
 
 void Log::logInternal(const char* file, int line, Severity severity, const char* macroArgs,
                       ArrayPtr<Array<char>> argValues) {
-  getExceptionCallback()->logMessage(
+  getExceptionCallback().logMessage(
       str(severity, ": ", file, ":", line, ": ",
           makeDescription(LOG, nullptr, 0, macroArgs, argValues), '\n'));
 }
@@ -199,7 +199,7 @@ void Log::logInternal(const char* file, int line, Severity severity, const char*
 void Log::recoverableFaultInternal(
     const char* file, int line, Exception::Nature nature,
     const char* condition, const char* macroArgs, ArrayPtr<Array<char>> argValues) {
-  getExceptionCallback()->onRecoverableException(
+  getExceptionCallback().onRecoverableException(
       Exception(nature, Exception::Durability::PERMANENT, file, line,
                 makeDescription(ASSERTION, condition, 0, macroArgs, argValues)));
 }
@@ -207,7 +207,7 @@ void Log::recoverableFaultInternal(
 void Log::fatalFaultInternal(
     const char* file, int line, Exception::Nature nature,
     const char* condition, const char* macroArgs, ArrayPtr<Array<char>> argValues) {
-  getExceptionCallback()->onFatalException(
+  getExceptionCallback().onFatalException(
       Exception(nature, Exception::Durability::PERMANENT, file, line,
                 makeDescription(ASSERTION, condition, 0, macroArgs, argValues)));
   abort();
@@ -216,7 +216,7 @@ void Log::fatalFaultInternal(
 void Log::recoverableFailedSyscallInternal(
     const char* file, int line, const char* call,
     int errorNumber, const char* macroArgs, ArrayPtr<Array<char>> argValues) {
-  getExceptionCallback()->onRecoverableException(
+  getExceptionCallback().onRecoverableException(
       Exception(Exception::Nature::OS_ERROR, Exception::Durability::PERMANENT, file, line,
                 makeDescription(SYSCALL, call, errorNumber, macroArgs, argValues)));
 }
@@ -224,15 +224,37 @@ void Log::recoverableFailedSyscallInternal(
 void Log::fatalFailedSyscallInternal(
     const char* file, int line, const char* call,
     int errorNumber, const char* macroArgs, ArrayPtr<Array<char>> argValues) {
-  getExceptionCallback()->onFatalException(
+  getExceptionCallback().onFatalException(
       Exception(Exception::Nature::OS_ERROR, Exception::Durability::PERMANENT, file, line,
                 makeDescription(SYSCALL, call, errorNumber, macroArgs, argValues)));
   abort();
 }
 
+void Log::addContextToInternal(Exception& exception, const char* file, int line,
+                               const char* macroArgs, ArrayPtr<Array<char>> argValues) {
+  exception.wrapContext(file, line, makeDescription(LOG, nullptr, 0, macroArgs, argValues));
+}
+
 int Log::getOsErrorNumber() {
   int result = errno;
   return result == EINTR ? -1 : result;
+}
+
+Log::Context::Context(): next(getExceptionCallback()), registration(*this) {}
+Log::Context::~Context() {}
+
+void Log::Context::onRecoverableException(Exception&& exception) {
+  addTo(exception);
+  next.onRecoverableException(capnproto::move(exception));
+}
+void Log::Context::onFatalException(Exception&& exception) {
+  addTo(exception);
+  next.onFatalException(capnproto::move(exception));
+}
+void Log::Context::logMessage(ArrayPtr<const char> text) {
+  // TODO(someday):  We could do something like log the context and then indent all log messages
+  //   written until the end of the context.
+  next.logMessage(text);
 }
 
 }  // namespace capnproto

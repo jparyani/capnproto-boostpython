@@ -52,10 +52,13 @@ struct NoInfer {
   typedef T Type;
 };
 
-template <typename T> struct RemoveReference { typedef T Type; };
-template <typename T> struct RemoveReference<T&> { typedef T Type; };
-template<typename> struct IsLvalueReference { static constexpr bool value = false; };
-template<typename T> struct IsLvalueReference<T&> { static constexpr bool value = true; };
+template <typename T> struct RemoveReference_ { typedef T Type; };
+template <typename T> struct RemoveReference_<T&> { typedef T Type; };
+template <typename> struct IsLvalueReference { static constexpr bool value = false; };
+template <typename T> struct IsLvalueReference<T&> { static constexpr bool value = true; };
+
+template <typename T>
+using RemoveReference = typename RemoveReference_<T>::Type;
 
 // #including <utility> just for std::move() and std::forward() is excessive.  Instead, we
 // re-define them here.
@@ -63,12 +66,333 @@ template<typename T> struct IsLvalueReference<T&> { static constexpr bool value 
 template<typename T> constexpr T&& move(T& t) noexcept { return static_cast<T&&>(t); }
 
 template<typename T>
-constexpr T&& forward(typename RemoveReference<T>::Type& t) noexcept {
+constexpr T&& forward(RemoveReference<T>& t) noexcept {
   return static_cast<T&&>(t);
 }
-template<typename T> constexpr T&& forward(typename RemoveReference<T>::Type&& t) noexcept {
+template<typename T> constexpr T&& forward(RemoveReference<T>&& t) noexcept {
   static_assert(!IsLvalueReference<T>::value, "Attempting to forward rvalue as lvalue reference.");
   return static_cast<T&&>(t);
+}
+
+template <typename T>
+T instance() noexcept;
+// Like std::declval, but doesn't transform T into an rvalue reference.  If you want that, specify
+// instance<T&&>().
+
+// #including <new> pulls in a lot of crap, but we want placement news.  But operator new cannot
+// be defined in a namespace, and defining it globally conflicts with the standard library
+// definition.  So...
+
+namespace internal {
+struct PlacementNew {};
+}  // namespace internal;
+} // namespace capnproto
+
+inline void* operator new(std::size_t, capnproto::internal::PlacementNew, void* __p) noexcept {
+  return __p;
+}
+
+namespace capnproto {
+
+template <typename T, typename... Params>
+void constructAt(T* location, Params&&... params) {
+  new (internal::PlacementNew(), location) T(capnproto::forward<Params>(params)...);
+}
+
+// =======================================================================================
+// Maybe
+
+template <typename T>
+class Maybe {
+public:
+  Maybe(): isSet(false) {}
+  Maybe(T&& t)
+      : isSet(true) {
+    constructAt(&value, capnproto::move(t));
+  }
+  Maybe(const T& t)
+      : isSet(true) {
+    constructAt(&value, t);
+  }
+  Maybe(Maybe&& other) noexcept(noexcept(T(capnproto::move(other.value))))
+      : isSet(other.isSet) {
+    if (isSet) {
+      constructAt(&value, capnproto::move(other.value));
+    }
+  }
+  Maybe(const Maybe& other)
+      : isSet(other.isSet) {
+    if (isSet) {
+      constructAt(&value, other.value);
+    }
+  }
+  template <typename U>
+  Maybe(Maybe<U>&& other) noexcept(noexcept(T(capnproto::move(other.value))))
+      : isSet(other.isSet) {
+    if (isSet) {
+      constructAt(&value, capnproto::move(other.value));
+    }
+  }
+  template <typename U>
+  Maybe(const Maybe<U>& other)
+      : isSet(other.isSet) {
+    if (isSet) {
+      constructAt(&value, other.value);
+    }
+  }
+  template <typename U>
+  Maybe(const Maybe<U&>& other)
+      : isSet(other.isSet) {
+    if (isSet) {
+      constructAt(&value, *other.ptr);
+    }
+  }
+  Maybe(std::nullptr_t): isSet(false) {}
+
+  ~Maybe() {
+    if (isSet) {
+      value.~T();
+    }
+  }
+
+  template <typename... Params>
+  inline void init(Params&&... params) {
+    if (isSet) {
+      value.~T();
+    }
+    isSet = true;
+    constructAt(&value, capnproto::forward(params)...);
+  }
+
+  inline T& operator*() { return value; }
+  inline const T& operator*() const { return value; }
+  inline T* operator->() { return &value; }
+  inline const T* operator->() const { return &value; }
+
+  inline Maybe& operator=(Maybe&& other) {
+    if (&other != this) {
+      if (isSet) {
+        value.~T();
+      }
+      isSet = other.isSet;
+      if (isSet) {
+        constructAt(&value, capnproto::move(other.value));
+      }
+    }
+    return *this;
+  }
+
+  inline Maybe& operator=(const Maybe& other) {
+    if (&other != this) {
+      if (isSet) {
+        value.~T();
+      }
+      isSet = other.isSet;
+      if (isSet) {
+        constructAt(&value, other.value);
+      }
+    }
+    return *this;
+  }
+
+  bool operator==(const Maybe& other) const {
+    if (isSet == other.isSet) {
+      if (isSet) {
+        return value == other.value;
+      } else {
+        return true;
+      }
+    }
+    return false;
+  }
+  inline bool operator!=(const Maybe& other) const { return !(*this == other); }
+
+  inline bool operator==(std::nullptr_t) const { return !isSet; }
+  inline bool operator!=(std::nullptr_t) const { return isSet; }
+
+  template <typename Func>
+  auto map(const Func& func) const -> Maybe<decltype(func(instance<const T&>()))> {
+    // Construct a new Maybe by applying the given function to the Maybe's value.
+
+    if (isSet) {
+      return func(value);
+    } else {
+      return nullptr;
+    }
+  }
+
+  template <typename Func>
+  auto map(const Func& func) -> Maybe<decltype(func(instance<T&>()))> {
+    // Construct a new Maybe by applying the given function to the Maybe's value.
+
+    if (isSet) {
+      return func(value);
+    } else {
+      return nullptr;
+    }
+  }
+
+  template <typename Func>
+  auto moveMap(const Func& func) -> Maybe<decltype(func(instance<T&&>()))> {
+    // Like map() but allows the function to take an rvalue reference to the value.
+
+    if (isSet) {
+      return func(capnproto::move(value));
+    } else {
+      return nullptr;
+    }
+  }
+
+private:
+  bool isSet;
+  union {
+    T value;
+  };
+
+  template <typename U>
+  friend class Maybe;
+};
+
+template <typename T>
+class Maybe<T&> {
+public:
+  Maybe(): ptr(nullptr) {}
+  Maybe(T& t): ptr(&t) {}
+  Maybe(std::nullptr_t): ptr(nullptr) {}
+  template <typename U>
+  Maybe(const Maybe<U>& other) {
+    if (other == nullptr) {
+      ptr = nullptr;
+    } else {
+      ptr = other.operator->();
+    }
+  }
+
+  ~Maybe() noexcept {}
+
+  inline T& operator*() { return *ptr; }
+  inline const T& operator*() const { return *ptr; }
+  inline T* operator->() { return ptr; }
+  inline const T* operator->() const { return ptr; }
+
+  inline bool operator==(const Maybe& other) const { return ptr == other.ptr; }
+  inline bool operator!=(const Maybe& other) const { return ptr != other.ptr; }
+  inline bool operator==(std::nullptr_t) const { return ptr == nullptr; }
+  inline bool operator!=(std::nullptr_t) const { return ptr != nullptr; }
+
+private:
+  T* ptr;
+
+  template <typename U>
+  friend class Maybe;
+};
+
+// =======================================================================================
+// Own<T> -- An owned pointer.
+
+class Disposer {
+  // Abstract interface for a thing that disposes of some other object.  Often, it makes sense to
+  // decouple an object from the knowledge of how to dispose of it.
+
+protected:
+  virtual ~Disposer();
+
+public:
+  virtual void dispose(void* interiorPointer) = 0;
+  // Disposes of the object that this Disposer owns, and possibly disposes of the disposer itself.
+  //
+  // Callers must assume that the Disposer itself is no longer valid once this returns -- e.g. it
+  // might delete itself.  Callers must in particular be sure not to call the Disposer again even
+  // when dispose() throws an exception.
+  //
+  // `interiorPointer` points somewhere inside of the object -- NOT necessarily at the beginning,
+  // especially in the presence of multiple inheritance.  Most implementations should ignore the
+  // pointer, though a tricky memory allocator could get away with sharing one Disposer among
+  // multiple objects if it can figure out how to find the beginning of the object given an
+  // arbitrary interior pointer.
+};
+
+template <typename T>
+class Own {
+  // A transferrable title to a T.  When an Own<T> goes out of scope, the object's Disposer is
+  // called to dispose of it.  An Own<T> can be efficiently passed by move, without relocating the
+  // underlying object; this transfers ownership.
+  //
+  // This is much like std::unique_ptr, except:
+  // - You cannot release().  An owned object is not necessarily allocated with new (see next
+  //   point), so it would be hard to use release() correctly.
+  // - The deleter is made polymorphic by virtual call rather than by template.  This is a much
+  //   more powerful default -- it allows any random module to decide to use a custom allocator.
+  //   This could be accomplished with unique_ptr by forcing everyone to use e.g.
+  //   std::unique_ptr<T, capnproto::Disposer&>, but at that point we've lost basically any benefit
+  //   of interoperating with std::unique_ptr anyway.
+
+public:
+  Own(const Own& other) = delete;
+  inline Own(Own&& other) noexcept
+      : disposer(other.disposer), ptr(other.ptr) { other.ptr = nullptr; }
+  template <typename U>
+  inline Own(Own<U>&& other) noexcept
+      : disposer(other.disposer), ptr(other.ptr) { other.ptr = nullptr; }
+  inline Own(T* ptr, Disposer* disposer) noexcept: disposer(disposer), ptr(ptr) {}
+
+  ~Own() noexcept { dispose(); }
+
+  inline Own& operator=(Own&& other) {
+    dispose();
+    disposer = other.disposer;
+    ptr = other.ptr;
+    other.ptr = nullptr;
+    return *this;
+  }
+
+  inline T* operator->() { return ptr; }
+  inline const T* operator->() const { return ptr; }
+  inline T& operator*() { return *ptr; }
+  inline const T& operator*() const { return *ptr; }
+  inline T* get() { return ptr; }
+  inline const T* get() const { return ptr; }
+  inline operator T*() { return ptr; }
+  inline operator const T*() const { return ptr; }
+
+private:
+  Disposer* disposer;  // Only valid if ptr != nullptr.
+  T* ptr;
+
+  inline void dispose() {
+    // Make sure that if an exception is thrown, we are left with a null ptr, so we won't possibly
+    // dispose again.
+    void* ptrCopy = ptr;
+    if (ptrCopy != nullptr) {
+      ptr = nullptr;
+      disposer->dispose(ptrCopy);
+    }
+  }
+};
+
+namespace internal {
+
+template <typename T>
+class HeapValue final: public Disposer {
+public:
+  template <typename... Params>
+  inline HeapValue(Params&&... params): value(capnproto::forward<Params>(params)...) {}
+
+  virtual void dispose(void*) override { delete this; }
+
+  T value;
+};
+
+}  // namespace internal
+
+template <typename T, typename... Params>
+Own<T> heap(Params&&... params) {
+  // heap<T>(...) allocates a T on the heap, forwarding the parameters to its constructor.  The
+  // exact heap implementation is unspecified -- for now it is operator new, but you should not
+  // assume anything.
+
+  auto result = new internal::HeapValue<T>(capnproto::forward<Params>(params)...);
+  return Own<T>(&result->value, result);
 }
 
 // =======================================================================================
@@ -171,9 +495,13 @@ public:
     CAPNPROTO_INLINE_DPRECOND(start <= end && end <= size_, "Out-of-bounds Array::slice().");
     return ArrayPtr<T>(ptr + start, end - start);
   }
+  inline ArrayPtr<const T> slice(size_t start, size_t end) const {
+    CAPNPROTO_INLINE_DPRECOND(start <= end && end <= size_, "Out-of-bounds Array::slice().");
+    return ArrayPtr<const T>(ptr + start, end - start);
+  }
 
-  inline bool operator==(std::nullptr_t) { return size_ == 0; }
-  inline bool operator!=(std::nullptr_t) { return size_ != 0; }
+  inline bool operator==(std::nullptr_t) const { return size_ == 0; }
+  inline bool operator!=(std::nullptr_t) const { return size_ != 0; }
 
   inline Array& operator=(std::nullptr_t) {
     delete[] ptr;
@@ -212,7 +540,19 @@ inline Array<T> newArray(size_t size) {
 
 template <typename T>
 class ArrayBuilder {
-  union Slot { T value; char dummy; };
+  // TODO(cleanup):  This class doesn't work for non-primitive types because Slot is not
+  //   constructable.  Giving Slot a constructor/destructor means arrays of it have to be tagged
+  //   so operator delete can run the destructors.  If we reinterpret_cast the array to an array
+  //   of T and delete it as that type, operator delete gets very upset.
+  //
+  //   Perhaps we should bite the bullet and make the Array family do manual memory allocation,
+  //   bypassing the rather-stupid C++ array new/delete operators which store a redundant copy of
+  //   the size anyway.
+
+  union Slot {
+    T value;
+    char dummy;
+  };
   static_assert(sizeof(Slot) == sizeof(T), "union is bigger than content?");
 
 public:
@@ -260,6 +600,37 @@ private:
 };
 
 // =======================================================================================
+// String -- Just a NUL-terminated Array<char>.
+
+class String {
+public:
+  String() = default;
+  String(const char* value);
+  String(const char* value, size_t length);
+
+  inline ArrayPtr<char> asArray();
+  inline ArrayPtr<const char> asArray() const;
+  inline const char* cStr() const { return content == nullptr ? "" : content.begin(); }
+
+  inline size_t size() const { return content == nullptr ? 0 : content.size() - 1; }
+
+  inline char* begin() { return content == nullptr ? nullptr : content.begin(); }
+  inline char* end() { return content == nullptr ? nullptr : content.end() - 1; }
+  inline const char* begin() const { return content == nullptr ? nullptr : content.begin(); }
+  inline const char* end() const { return content == nullptr ? nullptr : content.end() - 1; }
+
+private:
+  Array<char> content;
+};
+
+inline ArrayPtr<char> String::asArray() {
+  return content == nullptr ? ArrayPtr<char>(nullptr) : content.slice(0, content.size() - 1);
+}
+inline ArrayPtr<const char> String::asArray() const {
+  return content == nullptr ? ArrayPtr<char>(nullptr) : content.slice(0, content.size() - 1);
+}
+
+// =======================================================================================
 // IDs
 
 template <typename UnderlyingType, typename Label>
@@ -292,6 +663,19 @@ struct Id {
 // =======================================================================================
 // Units
 
+template <typename T> constexpr bool isIntegral() { return false; }
+template <> constexpr bool isIntegral<char>() { return true; }
+template <> constexpr bool isIntegral<signed char>() { return true; }
+template <> constexpr bool isIntegral<short>() { return true; }
+template <> constexpr bool isIntegral<int>() { return true; }
+template <> constexpr bool isIntegral<long>() { return true; }
+template <> constexpr bool isIntegral<long long>() { return true; }
+template <> constexpr bool isIntegral<unsigned char>() { return true; }
+template <> constexpr bool isIntegral<unsigned short>() { return true; }
+template <> constexpr bool isIntegral<unsigned int>() { return true; }
+template <> constexpr bool isIntegral<unsigned long>() { return true; }
+template <> constexpr bool isIntegral<unsigned long long>() { return true; }
+
 template <typename Number, typename Unit1, typename Unit2>
 class UnitRatio {
   // A multiplier used to convert Quantities of one unit to Quantities of another unit.  See
@@ -299,6 +683,8 @@ class UnitRatio {
   //
   // Construct this type by dividing one Quantity by another of a different unit.  Use this type
   // by multiplying it by a Quantity, or dividing a Quantity by it.
+
+  static_assert(isIntegral<Number>(), "Underlying type for UnitRatio must be integer.");
 
 public:
   inline UnitRatio() {}
@@ -310,6 +696,19 @@ public:
   template <typename OtherNumber>
   inline constexpr UnitRatio(const UnitRatio<OtherNumber, Unit1, Unit2>& other)
       : unit1PerUnit2(other.unit1PerUnit2) {}
+
+  template <typename OtherNumber>
+  inline constexpr UnitRatio<decltype(Number(1)+OtherNumber(1)), Unit1, Unit2>
+      operator+(UnitRatio<OtherNumber, Unit1, Unit2> other) {
+    return UnitRatio<decltype(Number(1)+OtherNumber(1)), Unit1, Unit2>(
+        unit1PerUnit2 + other.unit1PerUnit2);
+  }
+  template <typename OtherNumber>
+  inline constexpr UnitRatio<decltype(Number(1)-OtherNumber(1)), Unit1, Unit2>
+      operator-(UnitRatio<OtherNumber, Unit1, Unit2> other) {
+    return UnitRatio<decltype(Number(1)-OtherNumber(1)), Unit1, Unit2>(
+        unit1PerUnit2 - other.unit1PerUnit2);
+  }
 
   template <typename OtherNumber, typename Unit3>
   inline constexpr UnitRatio<decltype(Number(1)*OtherNumber(1)), Unit3, Unit2>
@@ -326,6 +725,30 @@ public:
         unit1PerUnit2 * other.unit1PerUnit2);
   }
 
+  template <typename OtherNumber, typename Unit3>
+  inline constexpr UnitRatio<decltype(Number(1)*OtherNumber(1)), Unit3, Unit2>
+      operator/(UnitRatio<OtherNumber, Unit1, Unit3> other) {
+    // (U1 / U2) / (U1 / U3) = U3 / U2
+    return UnitRatio<decltype(Number(1)*OtherNumber(1)), Unit3, Unit2>(
+        unit1PerUnit2 / other.unit1PerUnit2);
+  }
+  template <typename OtherNumber, typename Unit3>
+  inline constexpr UnitRatio<decltype(Number(1)*OtherNumber(1)), Unit1, Unit3>
+      operator/(UnitRatio<OtherNumber, Unit3, Unit2> other) {
+    // (U1 / U2) / (U3 / U2) = U1 / U3
+    return UnitRatio<decltype(Number(1)*OtherNumber(1)), Unit1, Unit3>(
+        unit1PerUnit2 / other.unit1PerUnit2);
+  }
+
+  template <typename OtherNumber>
+  inline decltype(Number(1) / OtherNumber(1))
+      operator/(UnitRatio<OtherNumber, Unit1, Unit2> other) const {
+    return unit1PerUnit2 / other.unit1PerUnit2;
+  }
+
+  inline bool operator==(UnitRatio other) const { return unit1PerUnit2 == other.unit1PerUnit2; }
+  inline bool operator!=(UnitRatio other) const { return unit1PerUnit2 != other.unit1PerUnit2; }
+
 private:
   Number unit1PerUnit2;
 
@@ -335,12 +758,14 @@ private:
   friend class UnitRatio;
 
   template <typename N1, typename N2, typename U1, typename U2>
-  friend inline constexpr decltype(N1(1) * N2(1)) operator*(N1, UnitRatio<N2, U1, U2>);
+  friend inline constexpr UnitRatio<decltype(N1(1) * N2(1)), U1, U2>
+      operator*(N1, UnitRatio<N2, U1, U2>);
 };
 
 template <typename N1, typename N2, typename U1, typename U2>
-inline constexpr decltype(N1(1) * N2(1)) operator*(N1 n, UnitRatio<N2, U1, U2> r) {
-  return n * r.unit1PerUnit2;
+inline constexpr UnitRatio<decltype(N1(1) * N2(1)), U1, U2>
+    operator*(N1 n, UnitRatio<N2, U1, U2> r) {
+  return UnitRatio<decltype(N1(1) * N2(1)), U1, U2>(n * r.unit1PerUnit2);
 }
 
 template <typename Number, typename Unit>
@@ -387,6 +812,8 @@ class Quantity {
   //     waitFor(3 * MINUTES);
   //   }
 
+  static_assert(isIntegral<Number>(), "Underlying type for Quantity must be integer.");
+
 public:
   inline constexpr Quantity() {}
 
@@ -411,11 +838,13 @@ public:
   template <typename OtherNumber>
   inline constexpr Quantity<decltype(Number(1) * OtherNumber(1)), Unit>
       operator*(OtherNumber other) const {
+    static_assert(isIntegral<OtherNumber>(), "Multiplied Quantity by non-integer.");
     return Quantity<decltype(Number(1) * other), Unit>(value * other);
   }
   template <typename OtherNumber>
   inline constexpr Quantity<decltype(Number(1) / OtherNumber(1)), Unit>
       operator/(OtherNumber other) const {
+    static_assert(isIntegral<OtherNumber>(), "Divided Quantity by non-integer.");
     return Quantity<decltype(Number(1) / other), Unit>(value / other);
   }
   template <typename OtherNumber>
@@ -549,7 +978,7 @@ class word { uint64_t content; CAPNPROTO_DISALLOW_COPY(word); public: word() = d
 static_assert(sizeof(byte) == 1, "uint8_t is not one byte?");
 static_assert(sizeof(word) == 8, "uint64_t is not 8 bytes?");
 
-namespace internal { class BitLabel; class ElementLabel; class WireReference; }
+namespace internal { class BitLabel; class ElementLabel; class WirePointer; }
 
 #ifndef CAPNPROTO_DEBUG_TYPES
 #define CAPNPROTO_DEBUG_TYPES 1
@@ -558,9 +987,9 @@ namespace internal { class BitLabel; class ElementLabel; class WireReference; }
 // also change symbol names, so it's important that the Cap'n proto library and any clients be
 // compiled with the same setting here.
 //
-// TODO:  Decide policy on this.  It may make sense to only use CAPNPROTO_DEBUG_TYPES when compiling
-//   Cap'n Proto's own tests, but disable it for all real builds, as clients may find this safety
-//   tiring.
+// TODO(soon):  Decide policy on this.  It may make sense to only use CAPNPROTO_DEBUG_TYPES when
+//   compiling Cap'n Proto's own tests, but disable it for all real builds, as clients may find
+//   this safety tiring.  Also, need to benchmark to verify there really is no perf hit.
 
 #endif
 
@@ -590,11 +1019,11 @@ typedef Quantity<uint16_t, internal::ElementLabel> ElementCount16;
 typedef Quantity<uint32_t, internal::ElementLabel> ElementCount32;
 typedef Quantity<uint64_t, internal::ElementLabel> ElementCount64;
 
-typedef Quantity<uint, internal::WireReference> WireReferenceCount;
-typedef Quantity<uint8_t, internal::WireReference> WireReferenceCount8;
-typedef Quantity<uint16_t, internal::WireReference> WireReferenceCount16;
-typedef Quantity<uint32_t, internal::WireReference> WireReferenceCount32;
-typedef Quantity<uint64_t, internal::WireReference> WireReferenceCount64;
+typedef Quantity<uint, internal::WirePointer> WirePointerCount;
+typedef Quantity<uint8_t, internal::WirePointer> WirePointerCount8;
+typedef Quantity<uint16_t, internal::WirePointer> WirePointerCount16;
+typedef Quantity<uint32_t, internal::WirePointer> WirePointerCount32;
+typedef Quantity<uint64_t, internal::WirePointer> WirePointerCount64;
 
 #else
 
@@ -622,11 +1051,11 @@ typedef uint16_t ElementCount16;
 typedef uint32_t ElementCount32;
 typedef uint64_t ElementCount64;
 
-typedef uint WireReferenceCount;
-typedef uint8_t WireReferenceCount8;
-typedef uint16_t WireReferenceCount16;
-typedef uint32_t WireReferenceCount32;
-typedef uint64_t WireReferenceCount64;
+typedef uint WirePointerCount;
+typedef uint8_t WirePointerCount8;
+typedef uint16_t WirePointerCount16;
+typedef uint32_t WirePointerCount32;
+typedef uint64_t WirePointerCount64;
 
 #endif
 
@@ -634,21 +1063,26 @@ constexpr BitCount BITS = unit<BitCount>();
 constexpr ByteCount BYTES = unit<ByteCount>();
 constexpr WordCount WORDS = unit<WordCount>();
 constexpr ElementCount ELEMENTS = unit<ElementCount>();
-constexpr WireReferenceCount REFERENCES = unit<WireReferenceCount>();
+constexpr WirePointerCount POINTERS = unit<WirePointerCount>();
 
 constexpr auto BITS_PER_BYTE = 8 * BITS / BYTES;
 constexpr auto BITS_PER_WORD = 64 * BITS / WORDS;
 constexpr auto BYTES_PER_WORD = 8 * BYTES / WORDS;
 
-constexpr auto BITS_PER_REFERENCE = 64 * BITS / REFERENCES;
-constexpr auto BYTES_PER_REFERENCE = 8 * BYTES / REFERENCES;
-constexpr auto WORDS_PER_REFERENCE = 1 * WORDS / REFERENCES;
+constexpr auto BITS_PER_POINTER = 64 * BITS / POINTERS;
+constexpr auto BYTES_PER_POINTER = 8 * BYTES / POINTERS;
+constexpr auto WORDS_PER_POINTER = 1 * WORDS / POINTERS;
 
-constexpr WordCount REFERENCE_SIZE_IN_WORDS = 1 * REFERENCES * WORDS_PER_REFERENCE;
+constexpr WordCount POINTER_SIZE_IN_WORDS = 1 * POINTERS * WORDS_PER_POINTER;
 
 template <typename T>
 inline constexpr decltype(BYTES / ELEMENTS) bytesPerElement() {
   return sizeof(T) * BYTES / ELEMENTS;
+}
+
+template <typename T>
+inline constexpr decltype(BITS / ELEMENTS) bitsPerElement() {
+  return sizeof(T) * 8 * BITS / ELEMENTS;
 }
 
 #ifndef __CDT_PARSER__

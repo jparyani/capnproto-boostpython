@@ -24,7 +24,10 @@
 module Parser (parseFile) where
 
 import Data.Generics
+import Data.Maybe(fromMaybe, listToMaybe)
+import Data.Word(Word64)
 import Text.Parsec hiding (tokens)
+import Text.Parsec.Error(newErrorMessage, Message(Message))
 import Token
 import Grammar
 import Lexer (lexer)
@@ -39,7 +42,7 @@ tokenErrorString (ParenthesizedList _) = "parenthesized list"
 tokenErrorString (BracketedList _) = "bracketed list"
 tokenErrorString (LiteralInt i) = "integer literal " ++ show i
 tokenErrorString (LiteralFloat f) = "float literal " ++ show f
-tokenErrorString (LiteralString s) = "string literal " ++  show s
+tokenErrorString (LiteralString s) = "string literal " ++ show s
 tokenErrorString AtSign = "\"@\""
 tokenErrorString Colon = "\":\""
 tokenErrorString DollarSign = "\"$\""
@@ -65,6 +68,7 @@ tokenErrorString StructKeyword = "keyword \"struct\""
 tokenErrorString UnionKeyword = "keyword \"union\""
 tokenErrorString InterfaceKeyword = "keyword \"interface\""
 tokenErrorString AnnotationKeyword = "keyword \"annotation\""
+tokenErrorString FixedKeyword = "keyword \"fixed\""
 
 type TokenParser = Parsec [Located Token] [ParseError]
 
@@ -87,6 +91,13 @@ matchLiteralBool t = case locatedValue t of
     _ -> Nothing
 matchSimpleToken expected t = if locatedValue t == expected then Just () else Nothing
 
+matchLiteralId :: Located Token -> Maybe Word64
+matchLiteralId (Located _ (LiteralInt i))
+    | i >= (2^(63 :: Integer)) &&
+      i <  (2^(64 :: Integer))
+    = Just (fromIntegral i)
+matchLiteralId _ = Nothing
+
 varIdentifier = tokenParser matchIdentifier
             <|> (tokenParser matchTypeIdentifier >>=
                  fail "Non-type identifiers must start with lower-case letter.")
@@ -102,6 +113,7 @@ anyIdentifier = tokenParser matchIdentifier
 literalInt = tokenParser (matchUnary LiteralInt) <?> "integer"
 literalFloat = tokenParser (matchUnary LiteralFloat) <?> "floating-point number"
 literalString = tokenParser (matchUnary LiteralString) <?> "string"
+literalId = tokenParser matchLiteralId <?> "id (generate using capnpc -i)"
 literalBool = tokenParser matchLiteralBool <?> "boolean"
 literalVoid = tokenParser (matchSimpleToken VoidKeyword) <?> "\"void\""
 
@@ -120,6 +132,7 @@ structKeyword = tokenParser (matchSimpleToken StructKeyword) <?> "\"struct\""
 unionKeyword = tokenParser (matchSimpleToken UnionKeyword) <?> "\"union\""
 interfaceKeyword = tokenParser (matchSimpleToken InterfaceKeyword) <?> "\"interface\""
 annotationKeyword = tokenParser (matchSimpleToken AnnotationKeyword) <?> "\"annotation\""
+fixedKeyword = tokenParser (matchSimpleToken FixedKeyword) <?> "\"fixed\""
 
 exactIdentifier s = tokenParser (matchSimpleToken $ Identifier s) <?> "\"" ++ s ++ "\""
 
@@ -146,10 +159,14 @@ declName = do
     members <- many (period >> located anyIdentifier)
     return (foldl MemberName base members :: DeclName)
 
+typeParameter :: TokenParser TypeParameter
+typeParameter = liftM TypeParameterInteger literalInt
+            <|> liftM TypeParameterType typeExpression
+
 typeExpression :: TokenParser TypeExpression
 typeExpression = do
     name <- declName
-    suffixes <- option [] (parenthesizedList typeExpression)
+    suffixes <- option [] (parenthesizedList typeParameter)
     return (TypeExpression name suffixes)
 
 nameWithOrdinal :: TokenParser (Located String, Located Integer)
@@ -158,6 +175,8 @@ nameWithOrdinal = do
     atSign
     ordinal <- located literalInt
     return (name, ordinal)
+
+declId = atSign >> literalId
 
 annotation :: TokenParser Annotation
 annotation = do
@@ -168,10 +187,15 @@ annotation = do
                   <|> return VoidFieldValue)
     return (Annotation name value)
 
-topLine :: Maybe [Located Statement] -> TokenParser (Either Declaration Annotation)
-topLine Nothing = liftM Left (usingDecl <|> constantDecl <|> annotationDecl)
-              <|> liftM Right annotation
-topLine (Just statements) = liftM Left $ typeDecl statements
+data TopLevelDecl = TopLevelDecl Declaration
+                  | TopLevelAnnotation Annotation
+                  | TopLevelId (Located Word64)
+
+topLine :: Maybe [Located Statement] -> TokenParser TopLevelDecl
+topLine Nothing = liftM TopLevelId (located declId)
+              <|> liftM TopLevelDecl (usingDecl <|> constantDecl <|> annotationDecl)
+              <|> liftM TopLevelAnnotation annotation
+topLine (Just statements) = liftM TopLevelDecl $ typeDecl statements
 
 usingDecl = do
     usingKeyword
@@ -207,9 +231,10 @@ typeDecl statements = enumDecl statements
 enumDecl statements = do
     enumKeyword
     name <- located typeIdentifier
+    typeId <- optionMaybe $ located declId
     annotations <- many annotation
     children <- parseBlock enumLine statements
-    return (EnumDecl name annotations children)
+    return (EnumDecl name typeId annotations children)
 
 enumLine :: Maybe [Located Statement] -> TokenParser Declaration
 enumLine Nothing = enumerantDecl
@@ -223,9 +248,35 @@ enumerantDecl = do
 structDecl statements = do
     structKeyword
     name <- located typeIdentifier
+    typeId <- optionMaybe $ located declId
+    fixed <- optionMaybe fixedSpec
     annotations <- many annotation
     children <- parseBlock structLine statements
-    return (StructDecl name annotations children)
+    return (StructDecl name typeId fixed annotations children)
+
+fixedSpec = do
+    fixedKeyword
+    Located pos sizes <- located $ parenthesizedList fixedSize
+    (dataSize, pointerSize) <- foldM combineFixedSizes (Nothing, Nothing) sizes
+    return $ Located pos (fromMaybe 0 dataSize, fromMaybe 0 pointerSize)
+
+data FixedSize = FixedData Integer | FixedPointers Integer
+
+combineFixedSizes :: (Maybe Integer, Maybe Integer) -> FixedSize
+                  -> TokenParser (Maybe Integer, Maybe Integer)
+combineFixedSizes (Nothing, p) (FixedData d) = return (Just d, p)
+combineFixedSizes (Just _, _) (FixedData _) =
+    fail "Multiple data section size specifications."
+combineFixedSizes (d, Nothing) (FixedPointers p) = return (d, Just p)
+combineFixedSizes (_, Just _) (FixedPointers _) =
+    fail "Multiple pointer section size specifications."
+
+fixedSize = do
+    size <- literalInt
+    -- We do not allow single-bit structs because most CPUs cannot address bits.
+    (exactIdentifier "bytes" >> return (FixedData (8 * size)))
+        <|> (exactIdentifier "pointers" >> return (FixedPointers size))
+        <?> "\"bytes\" or \"pointers\""
 
 structLine :: Maybe [Located Statement] -> TokenParser Declaration
 structLine Nothing = usingDecl <|> constantDecl <|> fieldDecl <|> annotationDecl
@@ -280,9 +331,10 @@ fieldAssignment = do
 interfaceDecl statements = do
     interfaceKeyword
     name <- located typeIdentifier
+    typeId <- optionMaybe $ located declId
     annotations <- many annotation
     children <- parseBlock interfaceLine statements
-    return (InterfaceDecl name annotations children)
+    return (InterfaceDecl name typeId annotations children)
 
 interfaceLine :: Maybe [Located Statement] -> TokenParser Declaration
 interfaceLine Nothing = usingDecl <|> constantDecl <|> methodDecl <|> annotationDecl
@@ -307,12 +359,13 @@ paramDecl = do
 annotationDecl = do
     annotationKeyword
     name <- located varIdentifier
+    annId <- optionMaybe $ located declId
     targets <- try (parenthesized asterisk >> return allAnnotationTargets)
            <|> parenthesizedList annotationTarget
     colon
     t <- typeExpression
     annotations <- many annotation
-    return (AnnotationDecl name t annotations targets)
+    return (AnnotationDecl name annId t annotations targets)
 allAnnotationTargets = [minBound::AnnotationTarget .. maxBound::AnnotationTarget]
 
 annotationTarget = (exactIdentifier "file" >> return FileAnnotation)
@@ -372,15 +425,23 @@ parseStatement parser (Located _ (Line tokens)) =
 parseStatement parser (Located _ (Block tokens statements)) =
     parseCollectingErrors (parser (Just statements)) tokens
 
-parseFileTokens :: [Located Statement] -> ([Declaration], [Annotation], [ParseError])
-parseFileTokens statements = (decls, annotations, errors) where
-    results :: [Either ParseError (Either Declaration Annotation, [ParseError])]
+parseFileTokens :: [Located Statement]
+                -> (Maybe (Located Word64), [Declaration], [Annotation], [ParseError])
+parseFileTokens statements = (fileId, decls, annotations, errors) where
+    results :: [Either ParseError (TopLevelDecl, [ParseError])]
     results = map (parseStatement topLine) statements
-    errors = concatMap extractErrors results
-    decls = [ decl | Right (Left decl, _) <- results ]
-    annotations = [ ann | Right (Right ann, _) <- results ]
+    errors = concatMap extractErrors results ++ idErrors
+    decls = [ decl | Right (TopLevelDecl decl, _) <- results ]
+    annotations = [ ann | Right (TopLevelAnnotation ann, _) <- results ]
+    ids = [ i | Right (TopLevelId i, _) <- results ]
+    fileId = listToMaybe ids
+    idErrors | length ids <= 1 = []
+             | otherwise = map makeDupeIdError ids
+    makeDupeIdError (Located pos _) =
+        newErrorMessage (Message "File declares multiple ids.") pos
 
-parseFile :: String -> String -> ([Declaration], [Annotation], [ParseError])
+parseFile :: String -> String
+          -> (Maybe (Located Word64), [Declaration], [Annotation], [ParseError])
 parseFile filename text = case parse lexer filename text of
-    Left e -> ([], [], [e])
+    Left e -> (Nothing, [], [], [e])
     Right statements -> parseFileTokens statements

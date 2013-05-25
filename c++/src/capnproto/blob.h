@@ -40,6 +40,11 @@ struct Text {
   class Builder;
 };
 
+template <size_t size>
+struct InlineData: public Data {};
+// Alias for Data used specifically for InlineData fields.  This primarily exists so that
+// List<InlineData<n>> can be specialized.
+
 class Data::Reader {
   // Points to a blob of bytes.  The usual Reader rules apply -- Data::Reader behaves like a simple
   // pointer which does not own its target, can be passed by value, etc.
@@ -50,6 +55,8 @@ class Data::Reader {
   // also be implicitly constructed from a NUL-terminated char*.
 
 public:
+  typedef Data Reads;
+
   inline Reader(): bytes(nullptr), size_(0) {}
   inline Reader(const char* bytes): bytes(bytes), size_(strlen(bytes)) {}
   inline Reader(char* bytes): bytes(bytes), size_(strlen(bytes)) {}
@@ -58,10 +65,6 @@ public:
   template <typename T>
   inline Reader(const T& other): bytes(other.data()), size_(other.size()) {}
   // Primarily intended for converting from std::string.
-
-  template <typename T>
-  inline operator T() const { return T(bytes, size_); }
-  // Primarily intended for converting to std::string.
 
   template <typename T>
   inline T as() const { return T(bytes, size_); }
@@ -89,6 +92,9 @@ public:
   inline bool operator< (const Reader& other) const { return !(other <= *this); }
   inline bool operator> (const Reader& other) const { return !(*this <= other); }
 
+  inline const char* begin() const { return bytes; }
+  inline const char* end() const { return bytes + size_; }
+
 private:
   const char* bytes;
   uint size_;
@@ -108,13 +114,11 @@ class Text::Reader: public Data::Reader {
   // such as std::string.
 
 public:
+  typedef Text Reads;
+
   inline Reader(): Data::Reader("", 0) {}
-  inline Reader(const char* text): Data::Reader(text, strlen(text)) {
-    CAPNPROTO_INLINE_DPRECOND(text[size()] == '\0', "Text must be NUL-terminated.");
-  }
-  inline Reader(char* text): Data::Reader(text, strlen(text)) {
-    CAPNPROTO_INLINE_DPRECOND(text[size()] == '\0', "Text must be NUL-terminated.");
-  }
+  inline Reader(const char* text): Data::Reader(text, strlen(text)) {}
+  inline Reader(char* text): Data::Reader(text, strlen(text)) {}
   inline Reader(const char* text, uint size): Data::Reader(text, size) {
     CAPNPROTO_INLINE_DPRECOND(text[size] == '\0', "Text must be NUL-terminated.");
   }
@@ -134,6 +138,8 @@ class Data::Builder {
   // other types.
 
 public:
+  typedef Data Builds;
+
   inline Builder(): bytes(nullptr), size_(0) {}
   inline Builder(char* bytes, uint size): bytes(bytes), size_(size) {}
 
@@ -178,6 +184,9 @@ public:
     memcpy(bytes, other, size_);
   }
 
+  inline char* begin() const { return bytes; }
+  inline char* end() const { return bytes + size_; }
+
 private:
   char* bytes;
   uint size_;
@@ -189,6 +198,8 @@ class Text::Builder: public Data::Builder {
   // so it is never necessary for the caller to do so.
 
 public:
+  typedef Text Builds;
+
   inline Builder(): Data::Builder(nulstr, 0) {}
   inline Builder(char* text, uint size): Data::Builder(text, size) { text[size] = '\0'; }
 

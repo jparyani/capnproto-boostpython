@@ -32,6 +32,7 @@
 #include <utility>
 #include <type_traits>
 #include "type-safety.h"
+#include "blob.h"
 #include <string.h>
 
 namespace capnproto {
@@ -39,7 +40,7 @@ namespace capnproto {
 // =======================================================================================
 // Arrays
 
-// TODO:  Move Array here?
+// TODO(cleanup):  Move these elsewhere, maybe an array.h.
 
 template <typename T, size_t fixedSize>
 class FixedArray {
@@ -82,9 +83,15 @@ public:
   inline const T* begin() const { return content; }
   inline const T* end() const { return content + currentSize; }
 
-  inline operator ArrayPtr<T>() const {
-    return arrayPtr(content, fixedSize);
+  inline operator ArrayPtr<T>() {
+    return arrayPtr(content, currentSize);
   }
+  inline operator ArrayPtr<const T>() const {
+    return arrayPtr(content, currentSize);
+  }
+
+  inline T& operator[](size_t index) { return content[index]; }
+  inline const T& operator[](size_t index) const { return content[index]; }
 
 private:
   size_t currentSize;
@@ -125,21 +132,11 @@ template <typename Element>
 Element* fill(Element* ptr) { return ptr; }
 
 template <typename Element, typename First, typename... Rest>
-Element* fill(Element* __restrict__ target, First& first, Rest&&... rest) {
+Element* fill(Element* __restrict__ target, const First& first, Rest&&... rest) {
   auto i = first.begin();
   auto end = first.end();
   while (i != end) {
     *target++ = *i++;
-  }
-  return fill(target, std::forward<Rest>(rest)...);
-}
-
-template <typename Element, typename First, typename... Rest>
-Element* fill(Element* __restrict__ target, First&& first, Rest&&... rest) {
-  auto i = first.begin();
-  auto end = first.end();
-  while (i != end) {
-    *target++ = std::move(*i++);
   }
   return fill(target, std::forward<Rest>(rest)...);
 }
@@ -178,12 +175,21 @@ struct Stringifier {
   // anything.
 
   inline ArrayPtr<const char> operator*(ArrayPtr<const char> s) const { return s; }
+  inline ArrayPtr<const char> operator*(const Array<const char>& s) const { return s; }
+  inline ArrayPtr<const char> operator*(const Array<char>& s) const { return s; }
+  template<size_t n>
+  inline ArrayPtr<const char> operator*(const CappedArray<char, n>& s) const { return s; }
   inline ArrayPtr<const char> operator*(const char* s) const { return arrayPtr(s, strlen(s)); }
+  inline ArrayPtr<const char> operator*(const String& s) const { return s.asArray(); }
 
   inline FixedArray<char, 1> operator*(char c) const {
     FixedArray<char, 1> result;
     result[0] = c;
     return result;
+  }
+
+  inline ArrayPtr<const char> operator*(Text::Reader text) const {
+    return arrayPtr(text.data(), text.size());
   }
 
   CappedArray<char, sizeof(short) * 4> operator*(short i) const;
@@ -196,8 +202,19 @@ struct Stringifier {
   CappedArray<char, sizeof(unsigned long long) * 4> operator*(unsigned long long i) const;
   CappedArray<char, 24> operator*(float f) const;
   CappedArray<char, 32> operator*(double f) const;
+  CappedArray<char, sizeof(const void*) * 4> operator*(const void* s) const;
+
+  template <typename T>
+  Array<char> operator*(ArrayPtr<T> arr) const;
+  template <typename T>
+  Array<char> operator*(const Array<T>& arr) const;
 };
 static constexpr Stringifier STR;
+
+CappedArray<char, sizeof(unsigned short) * 4> hex(unsigned short i);
+CappedArray<char, sizeof(unsigned int) * 4> hex(unsigned int i);
+CappedArray<char, sizeof(unsigned long) * 4> hex(unsigned long i);
+CappedArray<char, sizeof(unsigned long long) * 4> hex(unsigned long long i);
 
 template <typename... Params>
 Array<char> str(Params&&... params) {
@@ -208,6 +225,50 @@ Array<char> str(Params&&... params) {
   // To teach `str` how to stringify a type, see `Stringifier`.
 
   return concat<char>(STR * std::forward<Params>(params)...);
+}
+
+template <typename T>
+Array<char> strArray(T&& arr, const char* delim) {
+  size_t delimLen = strlen(delim);
+  decltype(STR * arr[0]) pieces[arr.size()];
+  size_t size = 0;
+  for (size_t i = 0; i < arr.size(); i++) {
+    if (i > 0) size += delimLen;
+    pieces[i] = STR * arr[i];
+    size += pieces[i].size();
+  }
+
+  Array<char> result = newArray<char>(size);
+  char* pos = result.begin();
+  for (size_t i = 0; i < arr.size(); i++) {
+    if (i > 0) {
+      memcpy(pos, delim, delimLen);
+      pos += delimLen;
+    }
+    pos = fill(pos, pieces[i]);
+  }
+  return result;
+}
+
+template <typename T>
+inline Array<char> Stringifier::operator*(ArrayPtr<T> arr) const {
+  return strArray(arr, ", ");
+}
+
+template <typename T>
+inline Array<char> Stringifier::operator*(const Array<T>& arr) const {
+  return strArray(arr, ", ");
+}
+
+template <typename T, typename Func>
+auto mapArray(T&& arr, Func&& func) -> Array<decltype(func(arr[0]))> {
+  // TODO(cleanup):  Use ArrayBuilder.
+  Array<decltype(func(arr[0]))> result = newArray<decltype(func(arr[0]))>(arr.size());
+  size_t pos = 0;
+  for (auto& element: arr) {
+    result[pos++] = func(element);
+  }
+  return result;
 }
 
 }  // namespace capnproto

@@ -26,6 +26,8 @@
 #include "util.h"
 #include "logging.h"
 #include <unistd.h>
+#include <execinfo.h>
+#include <stdlib.h>
 
 namespace capnproto {
 
@@ -57,22 +59,60 @@ Exception::Exception(Nature nature, Durability durability, const char* file, int
                      Array<char> description) noexcept
     : file(file), line(line), nature(nature), durability(durability),
       description(move(description)) {
-  bool hasDescription = this->description != nullptr;
-
-  // Must be careful to NUL-terminate this.
-  whatStr = str(file, ":", line, ": ", nature,
-                durability == Durability::TEMPORARY ? " (temporary)" : "",
-                hasDescription ? ": " : "", this->description, '\0');
+  traceCount = backtrace(trace, 16);
 }
 
 Exception::Exception(const Exception& other) noexcept
     : file(other.file), line(other.line), nature(other.nature), durability(other.durability),
-      description(str(other.description)), whatStr(str(other.whatStr)) {}
+      description(str(other.description)), traceCount(other.traceCount) {
+  memcpy(trace, other.trace, sizeof(trace[0]) * traceCount);
+
+  if (other.context != nullptr) {
+    context = heap<Context>(**other.context);
+  }
+}
 
 Exception::~Exception() noexcept {}
 
+Exception::Context::Context(const Context& other) noexcept
+    : file(other.file), line(other.line), description(str(other.description)) {
+  if (other.next != nullptr) {
+    next = heap<Context>(**other.next);
+  }
+}
+
+void Exception::wrapContext(const char* file, int line, Array<char>&& description) {
+  context = heap<Context>(file, line, move(description), move(context));
+}
+
 const char* Exception::what() const noexcept {
-  return whatStr.begin();
+  uint contextDepth = 0;
+
+  const Maybe<Own<Context>>* contextPtr = &context;
+  while (*contextPtr != nullptr) {
+    ++contextDepth;
+    contextPtr = &(***contextPtr).next;
+  }
+
+  Array<Array<char>> contextText = newArray<Array<char>>(contextDepth);
+
+  contextDepth = 0;
+  contextPtr = &context;
+  while (*contextPtr != nullptr) {
+    const Context& node = ***contextPtr;
+    contextText[contextDepth++] =
+        str(node.file, ":", node.line, ": context: ", node.description, "\n");
+    contextPtr = &node.next;
+  }
+
+  // Must be careful to NUL-terminate this.
+  whatBuffer = str(strArray(contextText, ""),
+                   file, ":", line, ": ", nature,
+                   durability == Durability::TEMPORARY ? " (temporary)" : "",
+                   this->description == nullptr ? "" : ": ", this->description,
+                   "\nstack: ", strArray(arrayPtr(trace, traceCount), " "), '\0');
+
+  return whatBuffer.begin();
 }
 
 // =======================================================================================
@@ -134,7 +174,7 @@ void ExceptionCallback::useProcessWide() {
   globalCallback = this;
 }
 
-ExceptionCallback::ScopedRegistration::ScopedRegistration(ExceptionCallback* callback)
+ExceptionCallback::ScopedRegistration::ScopedRegistration(ExceptionCallback& callback)
     : callback(callback) {
   old = threadLocalCallback;
   threadLocalCallback = this;
@@ -144,11 +184,11 @@ ExceptionCallback::ScopedRegistration::~ScopedRegistration() {
   threadLocalCallback = old;
 }
 
-ExceptionCallback* getExceptionCallback() {
+ExceptionCallback& getExceptionCallback() {
   static ExceptionCallback defaultCallback;
   ExceptionCallback::ScopedRegistration* scoped = threadLocalCallback;
   return scoped != nullptr ? scoped->getCallback() :
-     globalCallback != nullptr ? globalCallback : &defaultCallback;
+     globalCallback != nullptr ? *globalCallback : defaultCallback;
 }
 
 }  // namespace capnproto

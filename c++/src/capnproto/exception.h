@@ -65,6 +65,7 @@ public:
   Exception(Nature nature, Durability durability, const char* file, int line,
             Array<char> description = nullptr) noexcept;
   Exception(const Exception& other) noexcept;
+  Exception(Exception&& other) = default;
   ~Exception() noexcept;
 
   const char* getFile() const { return file; }
@@ -72,6 +73,32 @@ public:
   Nature getNature() const { return nature; }
   Durability getDurability() const { return durability; }
   ArrayPtr<const char> getDescription() const { return description; }
+
+  struct Context {
+    // Describes a bit about what was going on when the exception was thrown.
+
+    const char* file;
+    int line;
+    Array<char> description;
+    Maybe<Own<Context>> next;
+
+    Context(const char* file, int line, Array<char>&& description, Maybe<Own<Context>>&& next)
+        : file(file), line(line), description(move(description)), next(move(next)) {}
+    Context(const Context& other) noexcept;
+  };
+
+  inline Maybe<const Context&> getContext() const {
+    if (context == nullptr) {
+      return nullptr;
+    } else {
+      return **context;
+    }
+  }
+
+  void wrapContext(const char* file, int line, Array<char>&& description);
+  // Wraps the context in a new node.  This becomes the head node returned by getContext() -- it
+  // is expected that contexts will be added in reverse order as the exception passes up the
+  // callback stack.
 
   const char* what() const noexcept override;
 
@@ -81,7 +108,10 @@ private:
   Nature nature;
   Durability durability;
   Array<char> description;
-  Array<char> whatStr;
+  Maybe<Own<Context>> context;
+  void* trace[16];
+  uint traceCount;
+  mutable Array<char> whatBuffer;
 };
 
 class Stringifier;
@@ -97,6 +127,7 @@ class ExceptionCallback {
 
 public:
   ExceptionCallback();
+  CAPNPROTO_DISALLOW_COPY(ExceptionCallback);
   virtual ~ExceptionCallback();
 
   virtual void onRecoverableException(Exception&& exception);
@@ -131,18 +162,19 @@ public:
     // callback will be restored.
 
   public:
-    ScopedRegistration(ExceptionCallback* callback);
+    ScopedRegistration(ExceptionCallback& callback);
+    CAPNPROTO_DISALLOW_COPY(ScopedRegistration);
     ~ScopedRegistration();
 
-    inline ExceptionCallback* getCallback() { return callback; }
+    inline ExceptionCallback& getCallback() { return callback; }
 
   private:
-    ExceptionCallback* callback;
+    ExceptionCallback& callback;
     ScopedRegistration* old;
   };
 };
 
-ExceptionCallback* getExceptionCallback();
+ExceptionCallback& getExceptionCallback();
 // Returns the current exception callback.
 
 }  // namespace capnproto

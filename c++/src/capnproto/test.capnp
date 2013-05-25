@@ -21,9 +21,13 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+@0xd508eebdc2dc42b8;
+
 using Cxx = import "c++.capnp";
 
-$Cxx.namespace("capnproto::test");
+# Use a namespace likely to cause trouble if the generated code doesn't use fully-qualified
+# names for stuff in the capnproto namespace.
+$Cxx.namespace("capnproto_test::capnproto::test");
 
 enum TestEnum {
   foo @0;
@@ -114,7 +118,7 @@ struct TestDefaults {
       boolList      = [false, true, false, true, true],
       int8List      = [12, -34, -0x80, 0x7f],
       int16List     = [1234, -5678, -0x8000, 0x7fff],
-      int32List     = [12345678, -90123456, -0x8000000, 0x7ffffff],
+      int32List     = [12345678, -90123456, -0x80000000, 0x7fffffff],
       int64List     = [123456789012345, -678901234567890, -0x8000000000000000, 0x7fffffffffffffff],
       uInt8List     = [12, 34, 0, 0xff],
       uInt16List    = [1234, 5678, 0, 0xffff],
@@ -154,6 +158,22 @@ struct TestDefaults {
       (textField = "structlist 3")];
   enumList      @32 : List(TestEnum) = [foo, garply];
   interfaceList @33 : List(Void);  # TODO
+}
+
+struct TestObject {
+  objectField @0 :Object;
+}
+
+struct TestOutOfOrder {
+  foo @3 :Text;
+  bar @2 :Text;
+  baz @8 :Text;
+  qux @0 :Text;
+  quux @6 :Text;
+  corge @4 :Text;
+  grault @1 :Text;
+  garply @7 :Text;
+  waldo @5 :Text;
 }
 
 struct TestUnion {
@@ -213,7 +233,6 @@ struct TestUnion {
   bit5 @42: Bool;
   bit6 @43: Bool;
   bit7 @44: Bool;
-  byte0 @49: UInt8;
 
   # Interleave two unions to be really annoying.
   # Also declare in reverse order to make sure union discriminant values are sorted by field number
@@ -233,6 +252,8 @@ struct TestUnion {
     u3f0s8 @48: Int8;
     u3f0s1 @46: Bool;
   }
+
+  byte0 @49: UInt8;
 }
 
 struct TestUnionDefaults {
@@ -273,4 +294,79 @@ struct TestUsing {
 
   outerNestedEnum @1 :OuterNestedEnum = bar;
   innerNestedEnum @0 :NestedEnum = quux;
+}
+
+struct TestLists {
+  # Small structs, when encoded as list, will be encoded as primitive lists rather than struct
+  # lists, to save space.
+  struct Struct0  { f @0 :Void; }
+  struct Struct1  { f @0 :Bool; }
+  struct Struct8  { f @0 :UInt8; }
+  struct Struct16 { f @0 :UInt16; }
+  struct Struct32 { f @0 :UInt32; }
+  struct Struct64 { f @0 :UInt64; }
+  struct StructP  { f @0 :Text; }
+
+  list0  @0 :List(Struct0);
+  list1  @1 :List(Struct1);
+  list8  @2 :List(Struct8);
+  list16 @3 :List(Struct16);
+  list32 @4 :List(Struct32);
+  list64 @5 :List(Struct64);
+  listP  @6 :List(StructP);
+
+  int32ListList @7 :List(List(Int32));
+  textListList @8 :List(List(Text));
+  structListList @9 :List(List(TestAllTypes));
+}
+
+struct TestFieldZeroIsBit {
+  bit @0 :Bool;
+  secondBit @1 :Bool = true;
+  thirdField @2 :UInt8 = 123;
+}
+
+struct TestListDefaults {
+  lists @0 :TestLists = (
+      list0  = [(f = void), (f = void)],
+      list1  = [(f = true), (f = false), (f = true), (f = true)],
+      list8  = [(f = 123), (f = 45)],
+      list16 = [(f = 12345), (f = 6789)],
+      list32 = [(f = 123456789), (f = 234567890)],
+      list64 = [(f = 1234567890123456), (f = 2345678901234567)],
+      listP  = [(f = "foo"), (f = "bar")],
+      int32ListList = [[1, 2, 3], [4, 5], [12341234]],
+      textListList = [["foo", "bar"], ["baz"], ["qux", "corge"]],
+      structListList = [[(int32Field = 123), (int32Field = 456)], [(int32Field = 789)]]);
+}
+
+struct TestLateUnion {
+  # Test what happens if the unions are the first ordinals in the struct.  At one point this was
+  # broken for the dynamic API.
+
+  foo @0 :Int32;
+  bar @1 :Text;
+  baz @2 :Int16;
+
+  theUnion @3 union {
+    qux @4 :Text;
+    corge @5 :List(Int32);
+    grault @6 :Float32;
+  }
+}
+
+struct TestOldVersion {
+  # A subset of TestNewVersion.
+  old1 @0 :Int64;
+  old2 @1 :Text;
+  old3 @2 :TestOldVersion;
+}
+
+struct TestNewVersion {
+  # A superset of TestOldVersion.
+  old1 @0 :Int64;
+  old2 @1 :Text;
+  old3 @2 :TestNewVersion;
+  new1 @3 :Int64 = 987;
+  new2 @4 :Text = "baz";
 }

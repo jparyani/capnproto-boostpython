@@ -45,6 +45,9 @@ class ReaderArena;
 class BuilderArena;
 class ReadLimiter;
 
+class Segment;
+typedef Id<uint32_t, Segment> SegmentId;
+
 class ReadLimiter {
   // Used to keep track of how much data has been processed from a message, and cut off further
   // processing if and when a particular limit is reached.  This is primarily intended to guard
@@ -68,6 +71,10 @@ public:
 
   CAPNPROTO_ALWAYS_INLINE(bool canRead(WordCount amount, Arena* arena));
 
+  void unread(WordCount64 amount);
+  // Adds back some words to the limit.  Useful when the caller knows they are double-reading
+  // some data.
+
 private:
   WordCount64 limit;
 
@@ -79,7 +86,7 @@ public:
   inline SegmentReader(Arena* arena, SegmentId id, ArrayPtr<const word> ptr,
                        ReadLimiter* readLimiter);
 
-  CAPNPROTO_ALWAYS_INLINE(bool containsInterval(const word* from, const word* to));
+  CAPNPROTO_ALWAYS_INLINE(bool containsInterval(const void* from, const void* to));
 
   inline Arena* getArena();
   inline SegmentId getSegmentId();
@@ -89,6 +96,9 @@ public:
   inline WordCount getSize();
 
   inline ArrayPtr<const word> getArray();
+
+  inline void unread(WordCount64 amount);
+  // Add back some words to the ReadLimiter.
 
 private:
   Arena* arena;
@@ -135,7 +145,7 @@ public:
   // the VALIDATE_INPUT() macro which may throw an exception; if it return normally, the caller
   // will need to continue with default values.
 
-  // TODO:  Methods to deal with bundled capabilities.
+  // TODO(someday):  Methods to deal with bundled capabilities.
 };
 
 class ReaderArena final: public Arena {
@@ -177,7 +187,7 @@ public:
   // portion of each segment, whereas tryGetSegment() returns something that includes
   // not-yet-allocated space.
 
-  // TODO:  Methods to deal with bundled capabilities.
+  // TODO(someday):  Methods to deal with bundled capabilities.
 
   // implements Arena ------------------------------------------------
   SegmentReader* tryGetSegment(SegmentId id) override;
@@ -223,9 +233,12 @@ inline SegmentReader::SegmentReader(Arena* arena, SegmentId id, ArrayPtr<const w
                                     ReadLimiter* readLimiter)
     : arena(arena), id(id), ptr(ptr), readLimiter(readLimiter) {}
 
-inline bool SegmentReader::containsInterval(const word* from, const word* to) {
+inline bool SegmentReader::containsInterval(const void* from, const void* to) {
   return from >= this->ptr.begin() && to <= this->ptr.end() &&
-      readLimiter->canRead(intervalLength(from, to), arena);
+      readLimiter->canRead(
+          intervalLength(reinterpret_cast<const byte*>(from),
+                         reinterpret_cast<const byte*>(to)) / BYTES_PER_WORD,
+          arena);
 }
 
 inline Arena* SegmentReader::getArena() { return arena; }
@@ -236,6 +249,7 @@ inline WordCount SegmentReader::getOffsetTo(const word* ptr) {
 }
 inline WordCount SegmentReader::getSize() { return ptr.size() * WORDS; }
 inline ArrayPtr<const word> SegmentReader::getArray() { return ptr; }
+inline void SegmentReader::unread(WordCount64 amount) { readLimiter->unread(amount); }
 
 // -------------------------------------------------------------------
 
@@ -248,8 +262,8 @@ inline word* SegmentBuilder::allocate(WordCount amount) {
   if (amount > intervalLength(pos, ptr.end())) {
     return nullptr;
   } else {
-    // TODO:  Atomic increment, backtracking if we go over, would make this thread-safe.  How much
-    //   would it cost in the single-threaded case?  Is it free?  Benchmark it.
+    // TODO(someday):  Atomic increment, backtracking if we go over, would make this thread-safe.
+    //   How much would it cost in the single-threaded case?  Is it free?  Benchmark it.
     word* result = pos;
     pos += amount;
     return result;

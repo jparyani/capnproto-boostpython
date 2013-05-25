@@ -25,14 +25,17 @@ module Main ( main ) where
 
 import System.Environment
 import System.Console.GetOpt
-import System.Exit(exitFailure, exitSuccess)
-import System.IO(hPutStr, stderr)
+import System.Exit(exitFailure, exitSuccess, ExitCode(..))
+import System.IO(hPutStr, stderr, hSetBinaryMode, hClose)
 import System.FilePath(takeDirectory)
 import System.Directory(createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
+import System.Entropy(getEntropy)
+import System.Process(createProcess, proc, std_in, cwd, StdStream(CreatePipe), waitForProcess)
 import Control.Monad
-import Control.Monad.IO.Class(liftIO)
+import Control.Monad.IO.Class(MonadIO, liftIO)
 import Control.Exception(IOException, catch)
-import Control.Monad.Trans.State(StateT, state, modify, execStateT)
+import Control.Monad.Trans.State(StateT, state, modify, evalStateT)
+import qualified Control.Monad.Trans.State as State
 import Prelude hiding (catch)
 import Compiler
 import Util(delimit)
@@ -42,19 +45,26 @@ import Text.Printf(printf)
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy.Char8 as LZ
+import Data.ByteString(unpack, pack, hPut)
+import Data.Word(Word64, Word8)
+import Data.Maybe(fromMaybe, catMaybes)
+import Data.Function(on)
 import Semantics
+import WireFormat(encodeSchema)
 
 import CxxGenerator(generateCxx)
 import BoostPythonGenerator(generateBoost)
 
-type GeneratorFn = FileDesc -> IO [(FilePath, LZ.ByteString)]
+type GeneratorFn = [FileDesc] -> [Word8] -> Map.Map Word64 [Word8] -> IO [(FilePath, LZ.ByteString)]
 
+generatorFns :: Map.Map String GeneratorFn
 generatorFns = Map.fromList [ ("c++", generateCxx), ("boost-python", generateBoost) ]
 
 data Opt = SearchPathOpt FilePath
-         | OutputOpt String (Maybe GeneratorFn) FilePath
+         | OutputOpt String GeneratorFn FilePath
          | VerboseOpt
          | HelpOpt
+         | GenIdOpt
 
 main :: IO ()
 main = do
@@ -67,6 +77,7 @@ main = do
               \directory).  LANG may be any of:\n\
               \  " ++ unwords (Map.keys generatorFns))
          , Option "v" ["verbose"] (NoArg VerboseOpt) "Write information about parsed files."
+         , Option "i" ["generate-id"] (NoArg GenIdOpt) "Generate a new unique ID."
          , Option "h" ["help"] (NoArg HelpOpt) "Print usage info and exit."
          ]
     let usage = usageInfo
@@ -74,10 +85,7 @@ main = do
          \Generate source code based on Cap'n Proto definition FILEs.\n"
          optionDescs
     args <- getArgs
-    let (options, files, optErrs) = getOpt Permute optionDescs args
-    let langErrs = map (printf "Unknown output language: %s\n")
-                       [lang | OutputOpt lang Nothing _ <- options]
-    let errs = optErrs ++ langErrs
+    let (options, files, errs) = getOpt Permute optionDescs args
     unless (null errs) (do
         mapM_ (hPutStr stderr) errs
         hPutStr stderr usage
@@ -89,13 +97,18 @@ main = do
         exitFailure)
 
     let isHelp = not $ null [opt | opt@HelpOpt <- options]
-
     when isHelp (do
         putStr usage
         exitSuccess)
 
+    let isGenId = not $ null [opt | opt@GenIdOpt <- options]
+    when isGenId (do
+        i <- generateId
+        _ <- printf "@0x%016x\n" i
+        exitSuccess)
+
     let isVerbose = not $ null [opt | opt@VerboseOpt <- options]
-    let outputs = [(fn, dir) | OutputOpt _ (Just fn) dir <- options]
+    let outputs = [(fn, dir) | OutputOpt _ fn dir <- options]
     let searchPath = [dir | SearchPathOpt dir <- options]
 
     let verifyDirectoryExists dir = do
@@ -105,15 +118,65 @@ main = do
             exitFailure)
     mapM_ verifyDirectoryExists [dir | (_, dir) <- outputs]
 
-    CompilerState failed _ <-
-        execStateT (mapM_ (handleFile outputs isVerbose searchPath) files)
+    (failed, requestedFiles, allFiles) <-
+        evalStateT (handleFiles isVerbose searchPath files)
                    (CompilerState False Map.empty)
+
+    let (schema, schemaNodes) = encodeSchema requestedFiles allFiles
+        toEntry ((i, _), node) = (i, node)
+        schemaMap = Map.fromList $ map toEntry schemaNodes
+        areDupes (i, _) (j, _) = i == j
+        dupes = filter (\x -> length x > 1) $ List.groupBy areDupes
+              $ List.sortBy (compare `on` fst) $ map fst schemaNodes
+
+    unless (null dupes) (do
+        hPutStr stderr $ concat
+            ("Duplicate type / delcaration IDs detected:\n":
+             map (concatMap (uncurry $ printf "  @0x%016x %s\n")) dupes)
+        hPutStr stderr
+            "IDs (16-digit hex strings prefixed with @0x) must be unique.  Sorry I'm not\n\
+            \able to be more specific about where the duplicates were seen, but it should\n\
+            \be easy enough to grep, right?"
+        exitFailure)
+
+    mapM_ (doOutput requestedFiles schema schemaMap) outputs
+
     when failed exitFailure
 
+handleFiles isVerbose searchPath files = do
+    requestedFiles <- liftM catMaybes $ mapM (handleFile isVerbose searchPath) files
+    CompilerState failed importMap <- State.get
+    return (failed, requestedFiles, [ file | (_, ImportSucceeded file) <- Map.toList importMap ])
+
 parseOutputArg :: String -> Opt
-parseOutputArg str = case List.elemIndex ':' str of
-    Just i -> let (lang, _:dir) = splitAt i str in OutputOpt lang (Map.lookup lang generatorFns) dir
-    Nothing -> OutputOpt str (Map.lookup str generatorFns) "."
+parseOutputArg str = let
+    generatorFn lang wd = fromMaybe (callPlugin lang wd) $ Map.lookup lang generatorFns
+    in case List.elemIndex ':' str of
+        Just i -> let
+            (lang, _:dir) = splitAt i str
+            in OutputOpt lang (generatorFn lang (Just dir)) dir
+        Nothing -> OutputOpt str (generatorFn str Nothing) "."
+
+pluginName lang = if '/' `elem` lang then lang else "capnpc-" ++ lang
+
+callPlugin lang wd _ schema _ = do
+    (Just hin, _, _, p) <- createProcess (proc (pluginName lang) [])
+        { std_in = CreatePipe, cwd = wd }
+    hSetBinaryMode hin True
+    hPut hin (pack schema)
+    hClose hin
+    exitCode <- waitForProcess p
+    case exitCode of
+        ExitFailure 126 -> do
+            _ <- printf "Plugin for language '%s' is not executable.\n" lang
+            exitFailure
+        ExitFailure 127 -> do
+            _ <- printf "No plugin found for language '%s'.\n" lang
+            exitFailure
+        ExitFailure i -> do
+            _ <- printf "Plugin for language '%s' failed with exit code: %d\n" lang i
+            exitFailure
+        ExitSuccess -> return []
 
 -- As always, here I am, writing my own path manipulation routines, because the ones in the
 -- standard lib don't do what I want.
@@ -188,6 +251,16 @@ readAndParseFile isVerbose searchPath filename = do
         Right err -> return $ Right err
         Left text -> parseFile isVerbose searchPath filename text
 
+generateId :: MonadIO m => m Word64
+generateId = do
+    byteString <- liftIO $ getEntropy 8
+    let i | ix < 2^(63::Integer) = ix + 2^(63::Integer)
+          | otherwise = ix
+        ix = foldl addByte 0 (unpack byteString)
+        addByte :: Word64 -> Word8 -> Word64
+        addByte b v = b * 256 + fromIntegral v
+    return i
+
 parseFile isVerbose searchPath filename text = do
     let importCallback name = do
             let candidates = relativePath filename searchPath name
@@ -196,7 +269,7 @@ parseFile isVerbose searchPath filename text = do
                 Nothing -> return $ Right "File not found."
                 Just path -> importFile isVerbose searchPath path
 
-    status <- parseAndCompileFile filename text importCallback
+    status <- parseAndCompileFile filename text importCallback generateId
     case status of
         Active desc [] -> do
             when isVerbose (liftIO $ print desc)
@@ -208,21 +281,23 @@ parseFile isVerbose searchPath filename text = do
             liftIO $ mapM_ printError (List.sortBy compareErrors e)
             return $ Right "File contained errors."
 
-handleFile :: [(GeneratorFn, FilePath)] -> Bool -> [FilePath] -> FilePath -> CompilerMonad ()
-handleFile outputs isVerbose searchPath filename = do
+handleFile :: Bool -> [FilePath] -> FilePath -> CompilerMonad (Maybe FileDesc)
+handleFile isVerbose searchPath filename = do
     result <- importFile isVerbose searchPath filename
 
     case result of
-        Right _ -> return ()
-        Left desc -> do
-            let write dir (name, content) = do
-                    let outFilename = dir ++ "/" ++ name
-                    createDirectoryIfMissing True $ takeDirectory outFilename
-                    LZ.writeFile outFilename content
-                generate (generatorFn, dir) = do
-                    files <- generatorFn desc
-                    mapM_ (write dir) files
-            liftIO $ mapM_ generate outputs
+        Right _ -> return Nothing
+        Left desc -> return $ Just desc
+
+doOutput requestedFiles schema schemaMap output = do
+    let write dir (name, content) = do
+            let outFilename = dir ++ "/" ++ name
+            createDirectoryIfMissing True $ takeDirectory outFilename
+            LZ.writeFile outFilename content
+        generate (generatorFn, dir) = do
+            files <- generatorFn requestedFiles schema schemaMap
+            mapM_ (write dir) files
+    liftIO $ generate output
 
 compareErrors a b = compare (errorPos a) (errorPos b)
 

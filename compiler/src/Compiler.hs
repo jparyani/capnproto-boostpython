@@ -25,18 +25,22 @@ module Compiler (Status(..), parseAndCompileFile) where
 
 import Grammar
 import Semantics
-import Token(Located(Located), locatedPos, locatedValue)
+import Token(Located(Located), locatedValue)
 import Parser(parseFile)
-import Control.Monad(unless)
+import Control.Monad(when, unless, liftM)
 import qualified Data.Map as Map
 import Data.Map((!))
 import qualified Data.Set as Set
 import qualified Data.List as List
-import Data.Maybe(mapMaybe, fromMaybe, listToMaybe, catMaybes)
+import Data.Maybe(mapMaybe, fromMaybe, isJust, isNothing)
+import Data.Word(Word64, Word8)
 import Text.Parsec.Pos(SourcePos, newPos)
 import Text.Parsec.Error(ParseError, newErrorMessage, Message(Message, Expect))
 import Text.Printf(printf)
-import Util(delimit)
+import qualified Data.Digest.MD5 as MD5
+import qualified Codec.Binary.UTF8.String as UTF8
+import Util(delimit, intToBytes)
+import Data.Bits(setBit)
 
 ------------------------------------------------------------------------------------------
 -- Error helpers
@@ -67,9 +71,16 @@ instance Monad Status where
     return x = Active x []
     fail     = makeError (newPos "?" 0 0)
 
+-- Recovers from Failed status by using a fallback result, but keeps the errors.
+--
+-- This function is carefully written such that the runtime can see that it returns Active without
+-- actually evaluating the parameters.  The parameters are only evaluated when the returned value
+-- or errors are examined.
 recover :: a -> Status a -> Status a
-recover _ (Active x e) = Active x e
-recover x (Failed e)   = Active x e
+recover fallback status = Active value errs where
+    (value, errs) = case status of
+        Active v e -> (v, e)
+        Failed e -> (fallback, e)
 
 succeed :: a -> Status a
 succeed x = Active x []
@@ -154,7 +165,13 @@ lookupDesc scope name = lookupDesc (descParent scope) name
 builtinTypeMap :: Map.Map String Desc
 builtinTypeMap = Map.fromList
     ([(builtinTypeName t, DescBuiltinType t) | t <- builtinTypes] ++
-     [("List", DescBuiltinList), ("id", DescBuiltinId)])
+     [ ("List", DescBuiltinList)
+{- Inlines have been disabled for now because they added too much complication.
+     , ("Inline", DescBuiltinInline)
+     , ("InlineList", DescBuiltinInlineList)
+     , ("InlineData", DescBuiltinInlineData)
+-}
+     ])
 
 ------------------------------------------------------------------------------------------
 
@@ -234,8 +251,22 @@ compileValue pos (StructType desc) (RecordFieldValue fields) = do
 
     return (StructValueDesc assignments)
 
+compileValue pos (InlineStructType desc) v = compileValue pos (StructType desc) v
+
 compileValue _ (ListType t) (ListFieldValue l) =
     fmap ListDesc (doAll [ compileValue vpos t v | Located vpos v <- l ])
+
+compileValue pos (InlineListType t s) (ListFieldValue l) = do
+    elements <- doAll [ compileValue vpos t v | Located vpos v <- l ]
+    when (List.genericLength elements /= s) $
+        makeError pos $ printf "Fixed-size list must have exactly %d elements." s
+    return $ ListDesc elements
+
+compileValue pos (InlineDataType s) (StringFieldValue x) = let
+    bytes = map (fromIntegral . fromEnum) x
+    in if List.genericLength bytes == s
+        then succeed $ DataDesc bytes
+        else makeError pos $ printf "Fixed-size data must have exactly %d bytes." s
 
 compileValue pos (BuiltinType BuiltinVoid) _ = makeError pos "Void fields cannot have values."
 compileValue pos (BuiltinType BuiltinBool) _ = makeExpectError pos "boolean"
@@ -251,11 +282,17 @@ compileValue pos (BuiltinType BuiltinFloat32) _ = makeExpectError pos "number"
 compileValue pos (BuiltinType BuiltinFloat64) _ = makeExpectError pos "number"
 compileValue pos (BuiltinType BuiltinText) _ = makeExpectError pos "string"
 compileValue pos (BuiltinType BuiltinData) _ = makeExpectError pos "string"
+compileValue pos (BuiltinType BuiltinObject) _ =
+    -- TODO(someday):  We could arguably design a syntax where you specify the type followed by
+    --   the value, but it seems not worth the effort.
+    makeError pos "Can't specify literal value for 'Object'."
 
 compileValue pos (EnumType _) _ = makeExpectError pos "enumerant name"
 compileValue pos (StructType _) _ = makeExpectError pos "parenthesized list of field assignments"
-compileValue pos (InterfaceType _) _ = makeError pos "Interfaces can't have default values."
+compileValue pos (InterfaceType _) _ = makeError pos "Can't specify literal value for interface."
 compileValue pos (ListType _) _ = makeExpectError pos "list"
+compileValue pos (InlineListType _ _) _ = makeExpectError pos "list"
+compileValue pos (InlineDataType _) _ = makeExpectError pos "string"
 
 descAsType _ (DescEnum desc) = succeed (EnumType desc)
 descAsType _ (DescStruct desc) = succeed (StructType desc)
@@ -264,60 +301,99 @@ descAsType _ (DescBuiltinType desc) = succeed (BuiltinType desc)
 descAsType name (DescUsing desc) = descAsType name (usingTarget desc)
 descAsType name DescBuiltinList = makeError (declNamePos name) message where
             message = printf "'List' requires exactly one type parameter." (declNameString name)
+descAsType name DescBuiltinInline = makeError (declNamePos name) message where
+            message = printf "'Inline' requires exactly one type parameter." (declNameString name)
+descAsType name DescBuiltinInlineList = makeError (declNamePos name) message where
+            message = printf "'InlineList' requires exactly two type parameters." (declNameString name)
+descAsType name DescBuiltinInlineData = makeError (declNamePos name) message where
+            message = printf "'InlineData' requires exactly one type parameter." (declNameString name)
 descAsType name _ = makeError (declNamePos name) message where
             message = printf "'%s' is not a type." (declNameString name)
 
 compileType :: Desc -> TypeExpression -> Status TypeDesc
-compileType scope (TypeExpression n []) = do
-    desc <- lookupDesc scope n
-    descAsType n desc
-compileType scope (TypeExpression n (param:moreParams)) = do
+compileType scope (TypeExpression n params) = do
     desc <- lookupDesc scope n
     case desc of
-        DescBuiltinList ->
-            if null moreParams
-                then fmap ListType (compileType scope param)
-                else makeError (declNamePos n) "'List' requires exactly one type parameter."
-        _ -> makeError (declNamePos n) "Only the type 'List' can have type parameters."
+        DescBuiltinList -> case params of
+            [TypeParameterType param] ->  do
+                inner <- compileType scope param
+                case inner of
+                    InlineStructType _ -> makeError (declNamePos n)
+                        "Don't declare list elements 'Inline'.  The regular encoding for struct \
+                        \lists already inlines the elements."
+                    InlineListType (BuiltinType BuiltinBool) _ -> makeError (declNamePos n)
+                        "List(InlineList(Bool, n)) not supported due to implementation difficulty."
+                    BuiltinType BuiltinObject -> makeError (declNamePos n)
+                        "List(Object) not supported.  Just use Object, or create a struct with \
+                        \one field of type 'Object' and use a List of that."
+                    _ -> return (ListType inner)
+            _ -> makeError (declNamePos n) "'List' requires exactly one type parameter."
+        DescBuiltinInline -> case params of
+            [TypeParameterType param] -> do
+                inner <- compileType scope param
+                case inner of
+                    StructType s -> if structIsFixedWidth s
+                        then return (InlineStructType s)
+                        else makeError (declNamePos n) $
+                            printf "'%s' cannot be inlined because it is not fixed-width."
+                                   (structName s)
+                    _ -> makeError (declNamePos n) "'Inline' parameter must be a struct type."
+            _ -> makeError (declNamePos n) "'Inline' requires exactly one type parameter."
+        DescBuiltinInlineList -> case params of
+            [TypeParameterType param, TypeParameterInteger size] -> do
+                inner <- compileType scope param
+                case inner of
+                    InlineStructType _ -> makeError (declNamePos n)
+                        "Don't declare list elements 'Inline'.  The regular encoding for struct \
+                        \lists already inlines the elements."
+                    StructType s -> if structIsFixedWidth s
+                        then return (InlineListType (InlineStructType s) size)
+                        else makeError (declNamePos n) $
+                            printf "'%s' cannot be inlined because it is not fixed-width."
+                                   (structName s)
+                    InlineListType _ _ -> makeError (declNamePos n)
+                        "InlineList of InlineList not currently supported."
+                    InlineDataType _ -> makeError (declNamePos n)
+                        "InlineList of InlineData not currently supported."
+                    BuiltinType BuiltinObject -> makeError (declNamePos n)
+                        "InlineList(Object) not supported."
+                    _ -> return $ InlineListType inner size
+            _ -> makeError (declNamePos n)
+                "'InlineList' requires exactly two type parameters: a type and a size."
+        DescBuiltinInlineData -> case params of
+            [TypeParameterInteger size] -> return $ InlineDataType size
+            _ -> makeError (declNamePos n)
+                "'InlineData' requires exactly one type parameter: the byte size of the data."
+        _ -> case params of
+            [] -> descAsType n desc
+            _ -> makeError (declNamePos n) $
+                printf "'%s' doesn't take parameters." (declNameString n)
 
 compileAnnotation :: Desc -> AnnotationTarget -> Annotation
-                  -> Status (Maybe AnnotationDesc, ValueDesc)
+                  -> Status (AnnotationDesc, ValueDesc)
 compileAnnotation scope kind (Annotation name (Located pos value)) = do
     nameDesc <- lookupDesc scope name
     case nameDesc of
-        DescBuiltinId -> do
-            compiledValue <- compileValue pos (BuiltinType BuiltinText) value
-            return (Nothing, compiledValue)
         DescAnnotation annDesc -> do
             unless (Set.member kind (annotationTargets annDesc))
                 (makeError (declNamePos name)
                 $ printf "'%s' cannot be used on %s." (declNameString name) (show kind))
             compiledValue <- compileValue pos (annotationType annDesc) value
-            return (Just annDesc, compiledValue)
+            return (annDesc, compiledValue)
         _ -> makeError (declNamePos name)
            $ printf "'%s' is not an annotation." (declNameString name)
 
 compileAnnotations :: Desc -> AnnotationTarget -> [Annotation]
-                   -> Status (Maybe String, AnnotationMap)  -- (id, other annotations)
+                   -> Status AnnotationMap
 compileAnnotations scope kind annotations = do
     let compileLocated ann@(Annotation name _) =
             fmap (Located $ declNamePos name) $ compileAnnotation scope kind ann
 
     compiled <- doAll $ map compileLocated annotations
 
-    -- Makes a map entry for the annotation keyed by ID.  Throws out annotations with no ID.
-    let ids = [ Located pos i | Located pos (Nothing, TextDesc i) <- compiled ]
-        theId = fmap locatedValue $ listToMaybe ids
-        dupIds = map (flip makeError "Duplicate annotation 'id'." . locatedPos) $ List.drop 1 ids
-
-        -- For the annotations other than "id", we want to build a map keyed by annotation ID.
-        -- We drop any annotation that doesn't have an ID.
-        locatedEntries = catMaybes
-            [ annotationById pos (desc, v) | Located pos (Just desc, v) <- compiled ]
-        annotationById pos ann@(desc, _) =
-            case descAutoId (DescAnnotation desc) of
-                Just globalId -> Just (Located pos (globalId, ann))
-                Nothing -> Nothing
+    -- Makes a map entry for the annotation keyed by ID.
+    let locatedEntries = [ Located pos (annotationId desc, (desc, v))
+                         | Located pos (desc, v) <- compiled ]
 
         -- TODO(cleanup):  Generalize duplicate detection.
         sortedLocatedEntries = detectDup $ List.sortBy compareIds locatedEntries
@@ -328,9 +404,16 @@ compileAnnotations scope kind annotations = do
         detectDup [] = []
 
     finalEntries <- doAll sortedLocatedEntries
-    _ <- doAll dupIds
 
-    return (theId, Map.fromList finalEntries)
+    return $ Map.fromList finalEntries
+
+childId :: String -> Maybe (Located Word64) -> Desc -> Word64
+childId _ (Just (Located _ myId)) _ = myId
+childId name Nothing parent = let
+    hash = MD5.hash (intToBytes (descId parent) 8 ++ UTF8.encode name)
+    addByte :: Word64 -> Word8 -> Word64
+    addByte b v = b * 256 + fromIntegral v
+    in flip setBit 63 $ foldl addByte 0 (take 8 hash)
 
 ------------------------------------------------------------------------------------------
 
@@ -378,10 +461,6 @@ requireNoDuplicateNames decls = Active () (loop (List.sort locatedNames)) where
     dupError val = newErrorMessage (Message message) where
         message = printf "Duplicate declaration \"%s\"." val
 
-fieldInUnion name f = case fieldUnion f of
-    Nothing -> False
-    Just (x, _) -> unionName x == name
-
 requireNoMoreThanOneFieldNumberLessThan name pos num fields = Active () errors where
     retroFields = [fieldName f | f <- fields, fieldNumber f < num]
     message = printf "No more than one field in a union may have a number less than the \
@@ -399,102 +478,217 @@ extractFieldNumbers decls = concat
 
 ------------------------------------------------------------------------------------------
 
-initialPackingState = PackingState 0 0 0 0 0 0
+data PackingState = PackingState
+    { packingHoles :: Map.Map DataSize Integer
+    , packingDataSize :: Integer
+    , packingPointerCount :: Integer
+    }
 
-packValue :: FieldSize -> PackingState -> (Integer, PackingState)
-packValue Size64 s@(PackingState { packingDataSize = ds }) =
+initialPackingState = PackingState Map.empty 0 0
+
+packValue :: FieldSize -> PackingState -> (FieldOffset, PackingState)
+packValue SizeVoid s = (VoidOffset, s)
+packValue SizePointer s@(PackingState { packingPointerCount = rc }) =
+    (PointerOffset rc, s { packingPointerCount = rc + 1 })
+packValue (SizeInlineComposite (DataSectionWords inlineDs) inlineRc)
+          s@(PackingState { packingDataSize = ds, packingPointerCount = rc }) =
+    (InlineCompositeOffset ds rc (DataSectionWords inlineDs) inlineRc,
+        s { packingDataSize = ds + inlineDs
+          , packingPointerCount = rc + inlineRc })
+packValue (SizeInlineComposite inlineDs inlineRc)
+          s@(PackingState { packingPointerCount = rc }) = let
+    size = (dataSectionAlignment inlineDs)
+    (offset, s2) = packData size s
+    in (InlineCompositeOffset offset rc inlineDs inlineRc,
+        s2 { packingPointerCount = rc + inlineRc })
+packValue (SizeData size) s = let (o, s2) = packData size s in (DataOffset size o, s2)
+
+packData :: DataSize -> PackingState -> (Integer, PackingState)
+packData Size64 s@(PackingState { packingDataSize = ds }) =
     (ds, s { packingDataSize = ds + 1 })
-packValue SizeReference s@(PackingState { packingReferenceCount = rc }) =
-    (rc, s { packingReferenceCount = rc + 1 })
-packValue (SizeInlineComposite _ _) _ = error "Inline fields not yet supported."
-packValue Size32 s@(PackingState { packingHole32 = 0 }) =
-    case packValue Size64 s of
-        (o64, s2) -> (o64 * 2, s2 { packingHole32 = o64 * 2 + 1 })
-packValue Size32 s@(PackingState { packingHole32 = h32 }) =
-    (h32, s { packingHole32 = 0 })
-packValue Size16 s@(PackingState { packingHole16 = 0 }) =
-    case packValue Size32 s of
-        (o32, s2) -> (o32 * 2, s2 { packingHole16 = o32 * 2 + 1 })
-packValue Size16 s@(PackingState { packingHole16 = h16 }) =
-    (h16, s { packingHole16 = 0 })
-packValue Size8 s@(PackingState { packingHole8 = 0 }) =
-    case packValue Size16 s of
-        (o16, s2) -> (o16 * 2, s2 { packingHole8 = o16 * 2 + 1 })
-packValue Size8 s@(PackingState { packingHole8 = h8 }) =
-    (h8, s { packingHole8 = 0 })
-packValue Size1 s@(PackingState { packingHole1 = 0 }) =
-    case packValue Size8 s of
-        (o8, s2) -> (o8 * 8, s2 { packingHole1 = o8 * 8 + 1 })
-packValue Size1 s@(PackingState { packingHole1 = h1 }) =
-    (h1, s { packingHole1 = if mod (h1 + 1) 8 == 0 then 0 else h1 + 1 })
-packValue Size0 s = (0, s)
 
-initialUnionPackingState = UnionPackingState Nothing Nothing
+packData size s = let
+    -- updateLookupWithKey doesn't quite work here because it returns the new value if updated, or
+    -- the old value if not.  We really always want the old value and have no way to distinguish.
+    -- There appears to be no function that does this, AFAICT.
+    hole = Map.lookup size $ packingHoles s
+    newHoles = Map.update splitHole size $ packingHoles s
+    splitHole off = case size of
+        Size1 -> if mod off 8 == 7 then Nothing else Just (off + 1)
+        _ -> Nothing
+    in case hole of
+        -- If there was a hole of the correct size, use it.
+        Just off -> (off, s { packingHoles = newHoles })
+
+        -- Otherwise, try to pack a value of the next size up, and then split it.
+        Nothing -> let
+            nextSize = succ size
+            (nextOff, s2) = packData nextSize s
+            off = demoteOffset nextSize nextOff
+            newHoles2 = Map.insert size (off + 1) $ packingHoles s2
+            in (off, s2 { packingHoles = newHoles2 })
+
+-- Convert an offset of one data size to an offset of the next smaller size.
+demoteOffset :: DataSize -> Integer -> Integer
+demoteOffset Size1 _ = error "can't split bit"
+demoteOffset Size8 i = i * 8
+demoteOffset _ i = i * 2
+
+data UnionSlot sizeType = UnionSlot sizeType Integer   -- size, offset
+data UnionPackingState = UnionPackingState
+    { unionDataSlot :: UnionSlot DataSectionSize
+    , unionPointerSlot :: UnionSlot Integer }
+
+initialUnionPackingState = UnionPackingState (UnionSlot (DataSectionWords 0) 0) (UnionSlot 0 0)
 
 packUnionizedValue :: FieldSize             -- Size of field to pack.
                    -> UnionPackingState     -- Current layout of the union
                    -> PackingState          -- Current layout of the struct.
-                   -> (Integer, UnionPackingState, PackingState)
-packUnionizedValue (SizeInlineComposite _ _) _ _ = error "Can't put inline composite into union."
-packUnionizedValue Size0 u s = (0, u, s)
+                   -> (FieldOffset, UnionPackingState, PackingState)
 
--- Pack reference when we already have a reference slot allocated.
-packUnionizedValue SizeReference u@(UnionPackingState _ (Just offset)) s = (offset, u, s)
+packUnionizedValue SizeVoid u s = (VoidOffset, u, s)
 
--- Pack reference when we don't have a reference slot.
-packUnionizedValue SizeReference (UnionPackingState d Nothing) s = (offset, u2, s2) where
-    (offset, s2) = packValue SizeReference s
-    u2 = UnionPackingState d (Just offset)
+-- Pack data when there is no existing slot.
+packUnionizedValue (SizeData size) (UnionPackingState (UnionSlot (DataSectionWords 0) _) p) s =
+    let (offset, s2) = packData size s
+    in (DataOffset size offset,
+        UnionPackingState (UnionSlot (dataSizeToSectionSize size) offset) p, s2)
 
--- Pack data.
-packUnionizedValue size (UnionPackingState d r) s =
-    case packUnionizedData (fromMaybe (0, Size0) d) s size of
-        Just (offset, slotOffset, slotSize, s2) ->
-            (offset, UnionPackingState (Just (slotOffset, slotSize)) r, s2)
-        Nothing -> let
-            (offset, s2) = packValue size s
-            in (offset, UnionPackingState (Just (offset, size)) r, s2)
+-- Pack data when there is a word-sized slot.  All data fits in a word.
+packUnionizedValue (SizeData size)
+                   ups@(UnionPackingState (UnionSlot (DataSectionWords _) offset) _) s =
+    (DataOffset size (offset * div 64 (dataSizeInBits size)), ups, s)
 
-packUnionizedData :: (Integer, FieldSize)        -- existing slot to expand
-                  -> PackingState                -- existing packing state
-                  -> FieldSize                   -- desired field size
-                  -> Maybe (Integer,       -- Offset of the new field (in multiples of field size).
-                            Integer,       -- New offset of the slot (in multiples of slot size).
-                            FieldSize,     -- New size of the slot.
-                            PackingState)  -- New struct packing state.
+-- Pack data when there is a non-word-sized slot.
+packUnionizedValue (SizeData size) (UnionPackingState (UnionSlot slotSize slotOffset) p) s =
+    case tryExpandSubWordDataSlot (dataSectionAlignment slotSize, slotOffset) s size of
+        Just (offset, (newSlotSize, newSlotOffset), s2) ->
+            (DataOffset size offset,
+             UnionPackingState (UnionSlot (dataSizeToSectionSize newSlotSize) newSlotOffset) p, s2)
+        -- If the slot wasn't big enough, pack as if there were no slot.
+        Nothing -> packUnionizedValue (SizeData size)
+            (UnionPackingState (UnionSlot (DataSectionWords 0) 0) p) s
 
--- Don't try to allocate space for voids.
-packUnionizedData (slotOffset, slotSize) state Size0 = Just (0, slotOffset, slotSize, state)
+-- Pack pointer when we don't have a pointer slot.
+packUnionizedValue SizePointer u@(UnionPackingState _ (UnionSlot 0 _)) s = let
+    (PointerOffset offset, s2) = packValue SizePointer s
+    u2 = u { unionPointerSlot = UnionSlot 1 offset }
+    in (PointerOffset offset, u2, s2)
+
+-- Pack pointer when we already have a pointer slot allocated.
+packUnionizedValue SizePointer u@(UnionPackingState _ (UnionSlot _ offset)) s =
+    (PointerOffset offset, u, s)
+
+-- Pack inline composite.
+packUnionizedValue (SizeInlineComposite dataSize pointerCount)
+        u@(UnionPackingState { unionDataSlot = UnionSlot dataSlotSize dataSlotOffset
+                             , unionPointerSlot = UnionSlot pointerSlotSize pointerSlotOffset })
+        s = let
+
+    -- Pack the data section.
+    (dataOffset, u2, s2) = case dataSize of
+        DataSectionWords 0 -> (0, u, s)
+        DataSectionWords requestedWordSize -> let
+            maybeExpanded = case dataSlotSize of
+                -- Try to expand existing n-word slot to fit.
+                DataSectionWords existingWordSize ->
+                    tryExpandUnionizedDataWords u s
+                        dataSlotOffset existingWordSize requestedWordSize
+
+                -- Try to expand the existing sub-word slot into a word, then from there to a slot
+                -- of the size we need.
+                _ -> do
+                    (expandedSlotOffset, _, expandedPackingState) <-
+                        tryExpandSubWordDataSlot (dataSectionAlignment dataSlotSize, dataSlotOffset)
+                                                 s Size64
+                    let newU = u { unionDataSlot =
+                        UnionSlot (DataSectionWords 1) expandedSlotOffset }
+                    tryExpandUnionizedDataWords newU expandedPackingState
+                        expandedSlotOffset 1 requestedWordSize
+
+            -- If expanding fails, fall back to appending the new words to the end of the struct.
+            atEnd = (packingDataSize s,
+                u { unionDataSlot = UnionSlot (DataSectionWords requestedWordSize)
+                                              (packingDataSize s) },
+                s { packingDataSize = packingDataSize s + requestedWordSize })
+
+            in fromMaybe atEnd maybeExpanded
+        _ -> let
+            (DataOffset _ result, newU, newS) =
+                packUnionizedValue (SizeData (dataSectionAlignment dataSize)) u s
+            in (result, newU, newS)
+
+    -- Pack the pointer section.
+    (pointerOffset, u3, s3)
+        | pointerCount <= pointerSlotSize = (pointerSlotOffset, u2, s2)
+        | pointerSlotOffset + pointerSlotSize == packingPointerCount s2 =
+            (pointerSlotOffset,
+            u2 { unionPointerSlot = UnionSlot pointerCount pointerSlotOffset },
+            s2 { packingPointerCount = pointerSlotOffset + pointerCount })
+        | otherwise =
+            (packingPointerCount s2,
+            u2 { unionPointerSlot = UnionSlot pointerCount (packingPointerCount s2) },
+            s2 { packingPointerCount = packingPointerCount s2 + pointerCount })
+
+    combinedOffset = InlineCompositeOffset
+        { inlineCompositeDataOffset = dataOffset
+        , inlineCompositePointerOffset = pointerOffset
+        , inlineCompositeDataSize = dataSize
+        , inlineCompositePointerSize = pointerCount
+        }
+
+    in (combinedOffset, u3, s3)
+
+tryExpandUnionizedDataWords unionState packingState existingOffset existingSize requestedSize
+    -- Is the existing multi-word slot big enough?
+    | requestedSize <= existingSize =
+        -- Yes, use it.
+        Just (existingOffset, unionState, packingState)
+    -- Is the slot at the end of the struct?
+    | existingOffset + existingSize == packingDataSize packingState =
+        -- Yes, expand it.
+        Just (existingOffset,
+            unionState { unionDataSlot = UnionSlot (DataSectionWords requestedSize)
+                                                   existingOffset },
+            packingState { packingDataSize = packingDataSize packingState
+                                           + requestedSize - existingSize })
+    | otherwise = Nothing
+
+-- Try to expand an existing data slot to be big enough for a data field.
+tryExpandSubWordDataSlot :: (DataSize, Integer)          -- existing slot to expand
+                         -> PackingState                 -- existing packing state
+                         -> DataSize                     -- desired field size
+                         -> Maybe (Integer,              -- Offset of the new field.
+                                   (DataSize, Integer),  -- New offset of the slot.
+                                   PackingState)         -- New struct packing state.
 
 -- If slot is bigger than desired size, no expansion is needed.
-packUnionizedData (slotOffset, slotSize) state desiredSize
-    | sizeInBits slotSize >= sizeInBits desiredSize =
-    Just (div (sizeInBits slotSize) (sizeInBits desiredSize) * slotOffset,
-          slotOffset, slotSize, state)
+tryExpandSubWordDataSlot (slotSize, slotOffset) state desiredSize
+    | dataSizeInBits slotSize >= dataSizeInBits desiredSize =
+    Just (div (dataSizeInBits slotSize) (dataSizeInBits desiredSize) * slotOffset,
+          (slotSize, slotOffset), state)
 
--- If slot is a bit, and it is the first bit in its byte, and the bit hole immediately follows
--- expand it to a byte.
-packUnionizedData (slotOffset, Size1) p@(PackingState { packingHole1 = hole }) desiredSize
-    | mod slotOffset 8 == 0 && hole == slotOffset + 1 =
-        packUnionizedData (div slotOffset 8, Size8) (p { packingHole1 = 0 }) desiredSize
+-- Try expanding the slot by combining it with subsequent padding.
+tryExpandSubWordDataSlot (slotSize, slotOffset) state desiredSize = let
+    nextSize = succ slotSize
+    ratio = div (dataSizeInBits nextSize) (dataSizeInBits slotSize)
+    isAligned = mod slotOffset ratio == 0
+    nextOffset = div slotOffset ratio
 
--- If slot is size N, and the next N bits are padding, expand.
-packUnionizedData (slotOffset, Size8) p@(PackingState { packingHole8 = hole }) desiredSize
-    | hole == slotOffset + 1 =
-        packUnionizedData (div slotOffset 2, Size16) (p { packingHole8 = 0 }) desiredSize
-packUnionizedData (slotOffset, Size16) p@(PackingState { packingHole16 = hole }) desiredSize
-    | hole == slotOffset + 1 =
-        packUnionizedData (div slotOffset 2, Size32) (p { packingHole16 = 0 }) desiredSize
-packUnionizedData (slotOffset, Size32) p@(PackingState { packingHole32 = hole }) desiredSize
-    | hole == slotOffset + 1 =
-        packUnionizedData (div slotOffset 2, Size64) (p { packingHole32 = 0 }) desiredSize
+    deleteHole _ _ = Nothing
+    (maybeHole, newHoles) = Map.updateLookupWithKey deleteHole slotSize $ packingHoles state
+    newState = state { packingHoles = newHoles }
 
--- Otherwise, we fail.
-packUnionizedData _ _ _ = Nothing
+    in if not isAligned
+        then Nothing   -- Existing slot is not aligned properly.
+        else case maybeHole of
+            Just holeOffset | holeOffset == slotOffset + 1 ->
+                tryExpandSubWordDataSlot (nextSize, nextOffset) newState desiredSize
+            _ -> Nothing
 
 -- Determine the offset for the given field, and update the packing states to include the field.
 packField :: FieldDesc -> PackingState -> Map.Map Integer UnionPackingState
-          -> (Integer, PackingState, Map.Map Integer UnionPackingState)
+          -> (FieldOffset, PackingState, Map.Map Integer UnionPackingState)
 packField fieldDesc state unionState =
     case fieldUnion fieldDesc of
         Nothing -> let
@@ -511,13 +705,19 @@ packField fieldDesc state unionState =
 -- Determine the offset for the given union, and update the packing states to include the union.
 -- Specifically, this packs the union tag, *not* the fields of the union.
 packUnion :: UnionDesc -> PackingState -> Map.Map Integer UnionPackingState
-          -> (Integer, PackingState, Map.Map Integer UnionPackingState)
-packUnion _ state unionState = (offset, newState, unionState) where
-    (offset, newState) = packValue Size16 state
+          -> (FieldOffset, PackingState, Map.Map Integer UnionPackingState)
+packUnion _ state unionState = (DataOffset Size16 offset, newState, unionState) where
+    (offset, newState) = packData Size16 state
 
-packFields :: [FieldDesc] -> [UnionDesc]
-    -> (PackingState, Map.Map Integer UnionPackingState, Map.Map Integer (Integer, PackingState))
-packFields fields unions = (finalState, finalUnionState, Map.fromList packedItems) where
+stripHolesFromFirstWord Size1 _ = Size1  -- Stop at a bit.
+stripHolesFromFirstWord size holes = let
+    nextSize = pred size
+    in case Map.lookup nextSize holes of
+        Just 1 -> stripHolesFromFirstWord nextSize holes
+        _ -> size
+
+packFields :: [FieldDesc] -> [UnionDesc] -> (DataSectionSize, Integer, Map.Map Integer FieldOffset)
+packFields fields unions = let
     items = concat (
         [(fieldNumber d, packField d) | d <- fields]:
         [(unionNumber d, packUnion d):[(fieldNumber d2, packField d2) | d2 <- unionFields d]
@@ -526,12 +726,51 @@ packFields fields unions = (finalState, finalUnionState, Map.fromList packedItem
     itemsByNumber = List.sortBy compareNumbers items
     compareNumbers (a, _) (b, _) = compare a b
 
-    (finalState, finalUnionState, packedItems) =
+    (finalState, _, packedItems) =
         foldl packItem (initialPackingState, Map.empty, []) itemsByNumber
 
     packItem (state, unionState, packed) (n, item) =
-        (newState, newUnionState, (n, (offset, newState)):packed) where
+        (newState, newUnionState, (n, offset):packed) where
             (offset, newState, newUnionState) = item state unionState
+
+    dataSectionSize =
+        if packingDataSize finalState == 1
+            then dataSizeToSectionSize $ stripHolesFromFirstWord Size64 $ packingHoles finalState
+            else DataSectionWords $ packingDataSize finalState
+
+    in (dataSectionSize, packingPointerCount finalState, Map.fromList packedItems)
+
+enforceFixed Nothing sizes = return sizes
+enforceFixed (Just (Located pos (requestedDataSize, requestedPointerCount)))
+        (actualDataSize, actualPointerCount) = do
+    validatedRequestedDataSize <- case requestedDataSize of
+        1 -> return DataSection1
+        8 -> return DataSection8
+        16 -> return DataSection16
+        32 -> return DataSection32
+        s | mod s 64 == 0 -> return $ DataSectionWords $ div s 64
+        _ -> makeError pos $ printf "Struct data section size must be 0, 1, 2, 4, or a multiple of \
+                                    \8 bytes."
+
+    recover () $ when (dataSectionBits actualDataSize > dataSectionBits validatedRequestedDataSize) $
+        makeError pos $ printf "Struct data section size is %s which exceeds specified maximum of \
+            \%s.  WARNING:  Increasing the maximum will break backwards-compatibility."
+            (dataSectionSizeString actualDataSize)
+            (dataSectionSizeString validatedRequestedDataSize)
+    recover () $ when (actualPointerCount > requestedPointerCount) $
+        makeError pos $ printf "Struct pointer section size is %d pointers which exceeds specified \
+            \maximum of %d pointers.  WARNING:  Increasing the maximum will break \
+            \backwards-compatibility."
+            actualPointerCount requestedPointerCount
+
+    recover () $ when (dataSectionBits actualDataSize > maxStructDataWords * 64) $
+        makeError pos $ printf "Struct is too big.  Maximum data section size is %d bytes."
+            (maxStructDataWords * 8)
+    recover () $ when (actualPointerCount > maxStructPointers) $
+        makeError pos $ printf "Struct is too big.  Maximum pointer section size is %d."
+            maxStructPointers
+
+    return (validatedRequestedDataSize, requestedPointerCount)
 
 ------------------------------------------------------------------------------------------
 
@@ -562,27 +801,27 @@ compileDecl scope (ConstantDecl (Located _ name) t annotations (Located valuePos
     CompiledStatementStatus name (do
         typeDesc <- compileType scope t
         valueDesc <- compileValue valuePos typeDesc value
-        (theId, compiledAnnotations) <- compileAnnotations scope ConstantAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope ConstantAnnotation annotations
         return (DescConstant ConstantDesc
             { constantName = name
-            , constantId = theId
+            , constantId = childId name Nothing scope
             , constantParent = scope
             , constantType = typeDesc
             , constantValue = valueDesc
             , constantAnnotations = compiledAnnotations
             }))
 
-compileDecl scope (EnumDecl (Located _ name) annotations decls) =
+compileDecl scope (EnumDecl (Located _ name) maybeTypeId annotations decls) =
     CompiledStatementStatus name (feedback (\desc -> do
         (members, memberMap) <- compileChildDecls desc decls
         requireNoDuplicateNames decls
         let numbers = [ num | EnumerantDecl _ num _ <- decls ]
         requireSequentialNumbering "Enumerants" numbers
         requireOrdinalsInRange numbers
-        (theId, compiledAnnotations) <- compileAnnotations scope EnumAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope EnumAnnotation annotations
         return (DescEnum EnumDesc
             { enumName = name
-            , enumId = theId
+            , enumId = childId name maybeTypeId scope
             , enumParent = scope
             , enumerants = [d | DescEnumerant d <- members]
             , enumAnnotations = compiledAnnotations
@@ -593,10 +832,9 @@ compileDecl scope (EnumDecl (Located _ name) annotations decls) =
 compileDecl scope@(DescEnum parent)
             (EnumerantDecl (Located _ name) (Located _ number) annotations) =
     CompiledStatementStatus name (do
-        (theId, compiledAnnotations) <- compileAnnotations scope EnumerantAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope EnumerantAnnotation annotations
         return (DescEnumerant EnumerantDesc
             { enumerantName = name
-            , enumerantId = theId
             , enumerantParent = parent
             , enumerantNumber = number
             , enumerantAnnotations = compiledAnnotations
@@ -604,23 +842,27 @@ compileDecl scope@(DescEnum parent)
 compileDecl _ (EnumerantDecl (Located pos name) _ _) =
     CompiledStatementStatus name (makeError pos "Enumerants can only appear inside enums.")
 
-compileDecl scope (StructDecl (Located _ name) annotations decls) =
+compileDecl scope (StructDecl (Located _ name) maybeTypeId isFixed annotations decls) =
     CompiledStatementStatus name (feedback (\desc -> do
         (members, memberMap) <- compileChildDecls desc decls
         requireNoDuplicateNames decls
         let fieldNums = extractFieldNumbers decls
         requireSequentialNumbering "Fields" fieldNums
         requireOrdinalsInRange fieldNums
-        (theId, compiledAnnotations) <- compileAnnotations scope StructAnnotation annotations
-        return (let
+        compiledAnnotations <- compileAnnotations scope StructAnnotation annotations
+        let (dataSize, pointerCount, fieldPackingMap) = packFields fields unions
             fields = [d | DescField d <- members]
             unions = [d | DescUnion d <- members]
-            (packing, _, fieldPackingMap) = packFields fields unions
+        (finalDataSize, finalPointerCount) <-
+            recover (dataSize, pointerCount) $ enforceFixed isFixed (dataSize, pointerCount)
+        return (let
             in DescStruct StructDesc
             { structName = name
-            , structId = theId
+            , structId = childId name maybeTypeId scope
             , structParent = scope
-            , structPacking = packing
+            , structDataSize = finalDataSize
+            , structPointerCount = finalPointerCount
+            , structIsFixedWidth = isJust isFixed
             , structFields = fields
             , structUnions = unions
             , structAnnotations = compiledAnnotations
@@ -637,16 +879,14 @@ compileDecl scope@(DescStruct parent)
             orderedFieldNumbers = List.sort $ map fieldNumber fields
             discriminantMap = Map.fromList $ zip orderedFieldNumbers [0..]
         requireNoMoreThanOneFieldNumberLessThan name numPos number fields
-        (theId, compiledAnnotations) <- compileAnnotations scope UnionAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope UnionAnnotation annotations
         return (let
-            (tagOffset, tagPacking) = structFieldPackingMap parent ! number
+            DataOffset Size16 tagOffset = structFieldPackingMap parent ! number
             in DescUnion UnionDesc
             { unionName = name
-            , unionId = theId
             , unionParent = parent
             , unionNumber = number
             , unionTagOffset = tagOffset
-            , unionTagPacking = tagPacking
             , unionFields = fields
             , unionAnnotations = compiledAnnotations
             , unionMemberMap = memberMap
@@ -667,36 +907,46 @@ compileDecl scope
                 DescUnion u -> Just (u, unionFieldDiscriminantMap u ! number)
                 _ -> Nothing
         typeDesc <- compileType scope typeExp
+        recover () $ when (fieldSizeInBits (fieldSize typeDesc) > maxInlineFieldBits) $
+            makeError pos $ printf "Inlined fields cannot exceed %d bytes."
+            (div maxInlineFieldBits 8)
         defaultDesc <- case defaultValue of
-            Just (Located defaultPos value) -> fmap Just (compileValue defaultPos typeDesc value)
+            Just (Located defaultPos value) -> do
+                result <- fmap Just (compileValue defaultPos typeDesc value)
+                recover () (case typeDesc of
+                    InlineStructType _ ->
+                        makeError defaultPos "Inline fields cannot have default values."
+                    InlineListType _ _ ->
+                        makeError defaultPos "Inline fields cannot have default values."
+                    InlineDataType _ ->
+                        makeError defaultPos "Inline fields cannot have default values."
+                    _ -> return ())
+                return result
             Nothing -> return Nothing
-        (theId, compiledAnnotations) <- compileAnnotations scope FieldAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope FieldAnnotation annotations
         return (let
-            (offset, packing) = structFieldPackingMap parent ! number
             in DescField FieldDesc
             { fieldName = name
-            , fieldId = theId
             , fieldParent = parent
             , fieldNumber = number
-            , fieldOffset = offset
-            , fieldPacking = packing
+            , fieldOffset = structFieldPackingMap parent ! number
             , fieldUnion = unionDesc
             , fieldType = typeDesc
             , fieldDefaultValue = defaultDesc
             , fieldAnnotations = compiledAnnotations
             }))
 
-compileDecl scope (InterfaceDecl (Located _ name) annotations decls) =
+compileDecl scope (InterfaceDecl (Located _ name) maybeTypeId annotations decls) =
     CompiledStatementStatus name (feedback (\desc -> do
         (members, memberMap) <- compileChildDecls desc decls
         requireNoDuplicateNames decls
         let numbers = [ num | MethodDecl _ num _ _ _ <- decls ]
         requireSequentialNumbering "Methods" numbers
         requireOrdinalsInRange numbers
-        (theId, compiledAnnotations) <- compileAnnotations scope InterfaceAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope InterfaceAnnotation annotations
         return (DescInterface InterfaceDesc
             { interfaceName = name
-            , interfaceId = theId
+            , interfaceId = childId name maybeTypeId scope
             , interfaceParent = scope
             , interfaceMethods = [d | DescMethod    d <- members]
             , interfaceAnnotations = compiledAnnotations
@@ -709,10 +959,9 @@ compileDecl scope@(DescInterface parent)
     CompiledStatementStatus name (feedback (\desc -> do
         paramDescs <- doAll (map (compileParam desc) (zip [0..] params))
         returnTypeDesc <- compileType scope returnType
-        (theId, compiledAnnotations) <- compileAnnotations scope MethodAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope MethodAnnotation annotations
         return (DescMethod MethodDesc
             { methodName = name
-            , methodId = theId
             , methodParent = parent
             , methodNumber = number
             , methodParams = paramDescs
@@ -722,13 +971,13 @@ compileDecl scope@(DescInterface parent)
 compileDecl _ (MethodDecl (Located pos name) _ _ _ _) =
     CompiledStatementStatus name (makeError pos "Methods can only appear inside interfaces.")
 
-compileDecl scope (AnnotationDecl (Located _ name) typeExp annotations targets) =
+compileDecl scope (AnnotationDecl (Located _ name) maybeTypeId typeExp annotations targets) =
     CompiledStatementStatus name (do
         typeDesc <- compileType scope typeExp
-        (theId, compiledAnnotations) <- compileAnnotations scope AnnotationAnnotation annotations
+        compiledAnnotations <- compileAnnotations scope AnnotationAnnotation annotations
         return (DescAnnotation AnnotationDesc
             { annotationName = name
-            , annotationId = theId
+            , annotationId = childId name maybeTypeId scope
             , annotationParent = scope
             , annotationType = typeDesc
             , annotationAnnotations = compiledAnnotations
@@ -741,10 +990,9 @@ compileParam scope@(DescMethod parent)
     defaultDesc <- case defaultValue of
         Just (Located pos value) -> fmap Just (compileValue pos typeDesc value)
         Nothing -> return Nothing
-    (theId, compiledAnnotations) <- compileAnnotations scope ParamAnnotation annotations
+    compiledAnnotations <- compileAnnotations scope ParamAnnotation annotations
     return ParamDesc
         { paramName = name
-        , paramId = theId
         , paramParent = parent
         , paramNumber = ordinal
         , paramType = typeDesc
@@ -753,15 +1001,14 @@ compileParam scope@(DescMethod parent)
         }
 compileParam _ _ = error "scope of parameter was not a method"
 
-compileFile name decls annotations importMap =
+compileFile name theId decls annotations importMap =
     feedback (\desc -> do
         (members, memberMap) <- compileChildDecls (DescFile desc) decls
         requireNoDuplicateNames decls
-        (theId, compiledAnnotations)
-            <- compileAnnotations (DescFile desc) FileAnnotation annotations
+        compiledAnnotations <- compileAnnotations (DescFile desc) FileAnnotation annotations
         return FileDesc
             { fileName = name
-            , fileId = theId
+            , fileId = locatedValue theId
             , fileImports = Map.elems importMap
             , fileRuntimeImports =
                 Set.fromList $ map fileName $ concatMap descRuntimeImports members
@@ -776,7 +1023,7 @@ dedup = Set.toList . Set.fromList
 
 emptyFileDesc filename = FileDesc
     { fileName = filename
-    , fileId = Nothing
+    , fileId = 0x0
     , fileImports = []
     , fileRuntimeImports = Set.empty
     , fileAnnotations = Map.empty
@@ -789,9 +1036,10 @@ parseAndCompileFile :: Monad m
                     => FilePath                                -- Name of this file.
                     -> String                                  -- Content of this file.
                     -> (String -> m (Either FileDesc String))  -- Callback to import other files.
+                    -> m Word64                                -- Callback to generate a random id.
                     -> m (Status FileDesc)                     -- Compiled file and/or errors.
-parseAndCompileFile filename text importCallback = do
-    let (decls, annotations, parseErrors) = parseFile filename text
+parseAndCompileFile filename text importCallback randomCallback = do
+    let (maybeFileId, decls, annotations, parseErrors) = parseFile filename text
         importNames = dedup $ concatMap declImports decls
         doImport (Located pos name) = do
             result <- importCallback name
@@ -801,6 +1049,11 @@ parseAndCompileFile filename text importCallback = do
                     (makeError pos (printf "Couldn't import \"%s\": %s" name err))
 
     importStatuses <- mapM doImport importNames
+
+    let dummyPos = newPos filename 1 1
+    theFileId <- case maybeFileId of
+        Nothing -> liftM (Located dummyPos) randomCallback
+        Just i -> return i
 
     return (do
         -- We are now in the Status monad.
@@ -822,5 +1075,11 @@ parseAndCompileFile filename text importCallback = do
         -- of one bad import.
         imports <- doAll importStatuses
 
+        -- Report lack of an id.
+        when (isNothing maybeFileId) $
+            makeError dummyPos $
+                printf "File does not declare an ID.  I've generated one for you.  Add this line \
+                       \to your file: @0x%016x;" (locatedValue theFileId)
+
         -- Compile the file!
-        compileFile filename decls annotations $ Map.fromList imports)
+        compileFile filename theFileId decls annotations $ Map.fromList imports)

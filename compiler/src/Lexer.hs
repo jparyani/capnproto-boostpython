@@ -49,6 +49,7 @@ keywords =
     , (UnionKeyword, "union")
     , (InterfaceKeyword, "interface")
     , (AnnotationKeyword, "annotation")
+--    , (FixedKeyword, "fixed")     -- Inlines have been disabled because they were too complicated.
     ]
 
 languageDef :: T.LanguageDef st

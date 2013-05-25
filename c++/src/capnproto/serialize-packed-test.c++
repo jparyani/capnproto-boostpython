@@ -391,7 +391,7 @@ TEST(Packed, RoundTripAllZero) {
   checkTestMessageAllZero(reader.getRoot<TestAllTypes>());
 
   // Segment table packs to 2 bytes.
-  // Root reference packs to 3 bytes.
+  // Root pointer packs to 3 bytes.
   // Content packs to 2 bytes (zero span).
   EXPECT_LE(pipe.getData().size(), 7u);
 }
@@ -543,7 +543,7 @@ TEST(Packed, RoundTripHugeStringEvenSegmentCountLazy) {
   EXPECT_TRUE(reader.getRoot<TestAllTypes>().getTextField() == std::string(5023, 'x'));
 }
 
-// TODO:  Test error cases.
+// TODO(test):  Test error cases.
 
 }  // namespace
 }  // namespace internal

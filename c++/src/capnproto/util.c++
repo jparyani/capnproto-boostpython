@@ -47,8 +47,23 @@ STRINGIFY_INT(long, "%ld");
 STRINGIFY_INT(unsigned long, "%lu");
 STRINGIFY_INT(long long, "%lld");
 STRINGIFY_INT(unsigned long long, "%llu");
+STRINGIFY_INT(const void*, "%p");
 
 #undef STRINGIFY_INT
+
+#define HEXIFY_INT(type, format) \
+CappedArray<char, sizeof(type) * 4> hex(type i) { \
+  CappedArray<char, sizeof(type) * 4> result; \
+  result.setSize(sprintf(result.begin(), format, i)); \
+  return result; \
+}
+
+HEXIFY_INT(unsigned short, "%x");
+HEXIFY_INT(unsigned int, "%x");
+HEXIFY_INT(unsigned long, "%lx");
+HEXIFY_INT(unsigned long long, "%llx");
+
+#undef HEXIFY_INT
 
 namespace {
 

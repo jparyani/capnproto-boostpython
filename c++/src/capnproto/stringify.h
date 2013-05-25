@@ -21,19 +21,17 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "type-safety.h"
+#ifndef CAPNPROTO_STRINGIFY_H_
+#define CAPNPROTO_STRINGIFY_H_
+
+#include "dynamic.h"
 
 namespace capnproto {
 
-Disposer::~Disposer() {}
-
-String::String(const char* value): content(newArray<char>(strlen(value) + 1)) {
-  strcpy(content.begin(), value);
-}
-
-String::String(const char* value, size_t length): content(newArray<char>(length + 1)) {
-  memcpy(content.begin(), value, length);
-  content[length] = '\0';
-}
+String stringify(DynamicValue::Reader value);
+// Stringify an arbitrary Cap'n Proto value.  Note that DynamicValue::Reader can be implicitly
+// constructed from any Cap'n Proto field type, so this will accept pretty much anything.
 
 }  // namespace capnproto
+
+#endif  // CAPNPROTO_STRINGIFY_H_

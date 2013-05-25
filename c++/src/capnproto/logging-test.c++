@@ -45,13 +45,27 @@ public:
 
   void onRecoverableException(Exception&& exception) override {
     text += "recoverable exception: ";
-    text += exception.what();
+    // Discard the last line of "what" because it is a stack trace.
+    const char* what = exception.what();
+    const char* end = strrchr(what, '\n');
+    if (end == nullptr) {
+      text += exception.what();
+    } else {
+      text.append(what, end);
+    }
     text += '\n';
   }
 
   void onFatalException(Exception&& exception) override {
     text += "fatal exception: ";
-    text += exception.what();
+    // Discard the last line of "what" because it is a stack trace.
+    const char* what = exception.what();
+    const char* end = strrchr(what, '\n');
+    if (end == nullptr) {
+      text += exception.what();
+    } else {
+      text.append(what, end);
+    }
     text += '\n';
     throw MockException();
   }
@@ -72,7 +86,7 @@ std::string fileLine(std::string file, int line) {
 
 TEST(Logging, Log) {
   MockExceptionCallback mockCallback;
-  MockExceptionCallback::ScopedRegistration reg(&mockCallback);
+  MockExceptionCallback::ScopedRegistration reg(mockCallback);
   int line;
 
   LOG(WARNING, "Hello world!"); line = __LINE__;
@@ -123,7 +137,7 @@ TEST(Logging, Log) {
 
 TEST(Logging, Syscall) {
   MockExceptionCallback mockCallback;
-  MockExceptionCallback::ScopedRegistration reg(&mockCallback);
+  MockExceptionCallback::ScopedRegistration reg(mockCallback);
   int line;
 
   int i = 123;
@@ -143,6 +157,45 @@ TEST(Logging, Syscall) {
             + strerror(EBADF) + "; i = 123; bar; str = foo\n", mockCallback.text);
   EXPECT_LT(result, 0);
   EXPECT_TRUE(recovered);
+}
+
+TEST(Logging, Context) {
+  MockExceptionCallback mockCallback;
+  MockExceptionCallback::ScopedRegistration reg(mockCallback);
+
+  {
+    CONTEXT("foo"); int cline = __LINE__;
+    EXPECT_THROW(FAIL_CHECK("bar"), MockException); int line = __LINE__;
+
+    EXPECT_EQ("fatal exception: " + fileLine(__FILE__, cline) + ": context: foo\n"
+              + fileLine(__FILE__, line) + ": bug in code: bar\n",
+              mockCallback.text);
+    mockCallback.text.clear();
+
+    {
+      int i = 123;
+      const char* str = "qux";
+      CONTEXT("baz", i, "corge", str); int cline2 = __LINE__;
+      EXPECT_THROW(FAIL_CHECK("bar"), MockException); line = __LINE__;
+
+      EXPECT_EQ("fatal exception: " + fileLine(__FILE__, cline) + ": context: foo\n"
+                + fileLine(__FILE__, cline2) + ": context: baz; i = 123; corge; str = qux\n"
+                + fileLine(__FILE__, line) + ": bug in code: bar\n",
+                mockCallback.text);
+      mockCallback.text.clear();
+    }
+
+    {
+      CONTEXT("grault"); int cline2 = __LINE__;
+      EXPECT_THROW(FAIL_CHECK("bar"), MockException); line = __LINE__;
+
+      EXPECT_EQ("fatal exception: " + fileLine(__FILE__, cline) + ": context: foo\n"
+                + fileLine(__FILE__, cline2) + ": context: grault\n"
+                + fileLine(__FILE__, line) + ": bug in code: bar\n",
+                mockCallback.text);
+      mockCallback.text.clear();
+    }
+  }
 }
 
 }  // namespace

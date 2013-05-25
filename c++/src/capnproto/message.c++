@@ -49,11 +49,11 @@ internal::StructReader MessageReader::getRootInternal() {
     allocatedArena = true;
   }
 
-  internal::SegmentReader* segment = arena()->tryGetSegment(SegmentId(0));
+  internal::SegmentReader* segment = arena()->tryGetSegment(internal::SegmentId(0));
   VALIDATE_INPUT(segment != nullptr &&
       segment->containsInterval(segment->getStartPtr(), segment->getStartPtr() + 1),
       "Message did not contain a root pointer.") {
-    return internal::StructReader::readEmpty();
+    return internal::StructReader();
   }
 
   return internal::StructReader::readRoot(segment->getStartPtr(), segment, options.nestingLimit);
@@ -70,7 +70,7 @@ MessageBuilder::~MessageBuilder() {
 
 internal::SegmentBuilder* MessageBuilder::getRootSegment() {
   if (allocatedArena) {
-    return arena()->getSegment(SegmentId(0));
+    return arena()->getSegment(internal::SegmentId(0));
   } else {
     static_assert(sizeof(internal::BuilderArena) <= sizeof(arenaSpace),
         "arenaSpace is too small to hold a BuilderArena.  Please increase it.  This will break "
@@ -78,11 +78,11 @@ internal::SegmentBuilder* MessageBuilder::getRootSegment() {
     new(arena()) internal::BuilderArena(this);
     allocatedArena = true;
 
-    WordCount refSize = 1 * REFERENCES * WORDS_PER_REFERENCE;
-    internal::SegmentBuilder* segment = arena()->getSegmentWithAvailable(refSize);
-    CHECK(segment->getSegmentId() == SegmentId(0),
+    WordCount ptrSize = 1 * POINTERS * WORDS_PER_POINTER;
+    internal::SegmentBuilder* segment = arena()->getSegmentWithAvailable(ptrSize);
+    CHECK(segment->getSegmentId() == internal::SegmentId(0),
         "First allocated word of new arena was not in segment ID 0.");
-    word* location = segment->allocate(refSize);
+    word* location = segment->allocate(ptrSize);
     CHECK(location == segment->getPtrUnchecked(0 * WORDS),
         "First allocated word of new arena was not the first word in its segment.");
     return segment;
@@ -93,6 +93,12 @@ internal::StructBuilder MessageBuilder::initRoot(internal::StructSize size) {
   internal::SegmentBuilder* rootSegment = getRootSegment();
   return internal::StructBuilder::initRoot(
       rootSegment, rootSegment->getPtrUnchecked(0 * WORDS), size);
+}
+
+void MessageBuilder::setRootInternal(internal::StructReader reader) {
+  internal::SegmentBuilder* rootSegment = getRootSegment();
+  internal::StructBuilder::setRoot(
+      rootSegment, rootSegment->getPtrUnchecked(0 * WORDS), reader);
 }
 
 internal::StructBuilder MessageBuilder::getRoot(internal::StructSize size) {
@@ -204,6 +210,22 @@ ArrayPtr<word> MallocMessageBuilder::allocateSegment(uint minimumSize) {
   }
 
   return arrayPtr(reinterpret_cast<word*>(result), size);
+}
+
+// -------------------------------------------------------------------
+
+FlatMessageBuilder::FlatMessageBuilder(ArrayPtr<word> array): array(array), allocated(false) {}
+FlatMessageBuilder::~FlatMessageBuilder() {}
+
+void FlatMessageBuilder::requireFilled() {
+  PRECOND(getSegmentsForOutput()[0].end() == array.end(),
+          "FlatMessageBuilder's buffer was too large.");
+}
+
+ArrayPtr<word> FlatMessageBuilder::allocateSegment(uint minimumSize) {
+  PRECOND(!allocated, "FlatMessageBuilder's buffer was not large enough.");
+  allocated = true;
+  return array;
 }
 
 }  // namespace capnproto
