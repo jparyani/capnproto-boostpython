@@ -52,7 +52,8 @@ muNull = MuBool False;
 -- Using a single-element list has the same effect, though.
 muJust c = MuList [c]
 
-namespaceAnnotationId = "v3JF2GP4Supe9JSSJ3pnSdUqhJI.namespace"
+
+namespaceAnnotationId = 0xb9c6f99ebf805f2c
 
 fileNamespace desc = fmap testAnnotation $ Map.lookup namespaceAnnotationId $ fileAnnotations desc
 
@@ -91,6 +92,9 @@ isPrimitive (EnumType _) = True
 isPrimitive (StructType _) = False
 isPrimitive (InterfaceType _) = False
 isPrimitive (ListType _) = False
+isPrimitive (InlineStructType _) = False
+isPrimitive (InlineListType _ _) = False
+isPrimitive (InlineDataType _) = False
 
 isBlob (BuiltinType BuiltinText) = True
 isBlob (BuiltinType BuiltinData) = True
@@ -115,6 +119,7 @@ blobTypeString (BuiltinType BuiltinText) = "Text"
 blobTypeString (BuiltinType BuiltinData) = "Data"
 blobTypeString _ = error "Not a blob."
 
+
 cxxTypeString (BuiltinType BuiltinVoid) = " ::capnproto::Void"
 cxxTypeString (BuiltinType BuiltinBool) = "bool"
 cxxTypeString (BuiltinType BuiltinInt8) = " ::int8_t"
@@ -129,19 +134,37 @@ cxxTypeString (BuiltinType BuiltinFloat32) = "float"
 cxxTypeString (BuiltinType BuiltinFloat64) = "double"
 cxxTypeString (BuiltinType BuiltinText) = " ::capnproto::Text"
 cxxTypeString (BuiltinType BuiltinData) = " ::capnproto::Data"
+cxxTypeString (BuiltinType BuiltinObject) = " ::capnproto::Object"
 cxxTypeString (EnumType desc) = globalName $ DescEnum desc
 cxxTypeString (StructType desc) = globalName $ DescStruct desc
+cxxTypeString (InlineStructType desc) = globalName $ DescStruct desc
 cxxTypeString (InterfaceType desc) = globalName $ DescInterface desc
 cxxTypeString (ListType t) = concat [" ::capnproto::List<", cxxTypeString t, ">"]
+cxxTypeString (InlineListType t s) =
+    concat [" ::capnproto::InlineList<", cxxTypeString t, ", ", show s, ">"]
+cxxTypeString (InlineDataType s) =
+    concat [" ::capnproto::InlineData<", show s, ">"]
 
-cxxFieldSizeString Size0 = "VOID";
-cxxFieldSizeString Size1 = "BIT";
-cxxFieldSizeString Size8 = "BYTE";
-cxxFieldSizeString Size16 = "TWO_BYTES";
-cxxFieldSizeString Size32 = "FOUR_BYTES";
-cxxFieldSizeString Size64 = "EIGHT_BYTES";
-cxxFieldSizeString SizeReference = "REFERENCE";
+
+cxxFieldSizeString SizeVoid = "VOID";
+cxxFieldSizeString (SizeData Size1) = "BIT";
+cxxFieldSizeString (SizeData Size8) = "BYTE";
+cxxFieldSizeString (SizeData Size16) = "TWO_BYTES";
+cxxFieldSizeString (SizeData Size32) = "FOUR_BYTES";
+cxxFieldSizeString (SizeData Size64) = "EIGHT_BYTES";
+cxxFieldSizeString SizePointer = "POINTER";
 cxxFieldSizeString (SizeInlineComposite _ _) = "INLINE_COMPOSITE";
+
+fieldOffsetInteger VoidOffset = "0"
+fieldOffsetInteger (DataOffset _ o) = show o
+fieldOffsetInteger (PointerOffset o) = show o
+fieldOffsetInteger (InlineCompositeOffset d p ds ps) = let
+    byteSize = div (dataSectionBits ds) 8
+    byteOffset = case ds of
+        DataSectionWords _ -> d * 8
+        _ -> d * byteSize
+    in printf "%d * ::capnproto::BYTES, %d * ::capnproto::BYTES, \
+              \%d * ::capnproto::POINTERS, %d * ::capnproto::POINTERS" byteOffset byteSize p ps
 
 isDefaultZero VoidDesc = True
 isDefaultZero (BoolDesc    b) = not b
@@ -232,12 +255,12 @@ fieldContext parent desc = mkStrContext context where
             Nothing -> muNull
     context "fieldType" = MuVariable $ cxxTypeString $ fieldType desc
     context "fieldBlobType" = MuVariable $ blobTypeString $ fieldType desc
-    context "fieldOffset" = MuVariable $ fieldOffset desc
+    context "fieldOffset" = MuVariable $ fieldOffsetInteger $ fieldOffset desc
     context "fieldDefaultMask" = case fieldDefaultValue desc of
         Nothing -> MuVariable ""
         Just v -> MuVariable (if isDefaultZero v then "" else ", " ++ defaultMask v)
     context "fieldElementSize" =
-        MuVariable $ cxxFieldSizeString $ elementSize $ elementType $ fieldType desc
+        MuVariable $ cxxFieldSizeString $ fieldSize $ elementType $ fieldType desc
     context "fieldElementType" =
         MuVariable $ cxxTypeString $ elementType $ fieldType desc
     context "fieldElementTypePython" =
@@ -300,8 +323,8 @@ structContext parent desc = mkStrContext context where
     context "structFullName" = MuVariable $ fullNameString
     context "structFields" = MuList $ map (fieldContext context) $ structFields desc
     context "structUnions" = MuList $ map (unionContext context) $ structUnions desc
-    context "structDataSize" = MuVariable $ packingDataSize $ structPacking desc
-    context "structReferenceCount" = MuVariable $ packingReferenceCount $ structPacking desc
+    context "structDataSize" = MuVariable $ dataSectionWordSize $ structDataSize desc
+    context "structPointerCount" = MuVariable $ structPointerCount desc
     context "structNestedEnums" =
         MuList $ map (enumContext context) [m | DescEnum m <- structMembers desc]
     context "structNestedStructs" =
@@ -343,7 +366,7 @@ fileContext desc = mkStrContext context where
     context "fileName" = MuVariable $ fileName desc
     context "fileBasename" = MuVariable $ takeBaseName $ fileName desc
     context "fileIncludeGuard" = MuVariable $
-        "CAPNPROTO_INCLUDED_" ++ hashString (fileName desc ++ ':':fromMaybe "" (fileId desc))
+        "CAPNPROTO_INCLUDED_" ++ hashString (fileName desc ++ ':':show (fileId desc))
     context "fileNamespaces" = MuList $ map (namespaceContext context) namespace
     context "fileEnums" = MuList $ map (enumContext context) [e | DescEnum e <- fileMembers desc]
     context "fileTypes" = MuList $ map (typeContext context) flattenedMembers
@@ -366,7 +389,10 @@ hastacheConfig = MuConfig
 
 generateCxxSource file = hastacheStr hastacheConfig (encodeStr srcTemplate) (fileContext file)
 
-generateBoost file = do
-    source <- generateCxxSource file
-    return [(fileName file ++ ".boost-python.c++", source)]
+generateBoost files _ schemaNodes = do
+    let handleFile file = do
+            source <- generateCxxSource file
+            return [(fileName file ++ ".boost-python.c++", source)]
+    results <- mapM handleFile files
+    return $ concat results
     

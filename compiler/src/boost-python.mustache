@@ -227,7 +227,7 @@ BOOST_PYTHON_MODULE({{fileBasename}})
 {{/fileTypes}}
 
 {{#fileEnums}}
-  enum_<{{{enumName}}>("{{enumName}}")
+  enum_<{{enumName}}>("{{enumName}}")
 {{#enumerants}}
     .value("{{enumerantName}}", {{enumName}}::{{enumerantName}})
 {{/enumerants}}

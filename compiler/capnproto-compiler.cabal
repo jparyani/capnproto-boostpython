@@ -30,7 +30,7 @@ executable capnpc
                    directory,
                    syb,
                    MissingH,
-                   transformers
+                   transformers,
                    entropy,
                    process
   ghc-options:     -Wall -fno-warn-missing-signatures
